@@ -18,3 +18,5 @@ main/mmap_generate_emoji.h
 *.bin
 mmap_generate_*.h
 .clangd
+demo/
+ESP32-S3-Touch-LCD-1.46.pdf
