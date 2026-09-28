@@ -16,9 +16,19 @@
 #include <esp_timer.h>
 #include "esp_io_expander_tca9554.h"
 #include "lcd_display.h"
+#include "lvgl_theme.h"
+#include "touch_spd2010.h"
 #include <iot_button.h>
+#include <cstring>
 
 #define TAG "waveshare_lcd_1_46"
+
+// Function cards reachable by swipe: index 0 is the built-in AI screen, 1 is the
+// extra page built by BuildHelloPage(). More cards can be appended later.
+constexpr int kCardCount = 2;
+
+// Horizontal distance needed to switch card, ~15% of the 412 px panel.
+constexpr int kSwipeThresholdPx = 60;
 
 // 在waveshare_lcd_1_46类之前添加新的显示类
 class CustomLcdDisplay : public SpiLcdDisplay {
@@ -44,7 +54,18 @@ public:
         : SpiLcdDisplay(io_handle, panel_handle,
                     width, height, offset_x, offset_y, mirror_x, mirror_y, swap_xy) {
         // Note: UI customization should be done in SetupUI(), not in constructor
-        // to ensure lvgl objects are created before accessing them
+        // to ensure lvgl objects are created before accessing them.
+        // Theme color objects, however, already exist once the base constructor
+        // has finished, and SetupUI() has not run yet - so adjust them here to
+        // keep this board's black background / white text without touching the
+        // shared themes in lcd_display.cc.
+        for (const char* name : {"light", "dark"}) {
+            auto* theme = LvglThemeManager::GetInstance().GetTheme(name);
+            if (theme != nullptr) {
+                theme->set_background_color(lv_color_hex(0x000000));
+                theme->set_text_color(lv_color_hex(0xFFFFFF));
+            }
+        }
     }
 
     virtual void SetupUI() override {
@@ -53,7 +74,121 @@ public:
 
         DisplayLockGuard lock(this);
         lv_display_add_event_cb(display_, rounder_event_cb, LV_EVENT_INVALIDATE_AREA, NULL);
+
+        lv_obj_t* screen = lv_screen_active();
+        BuildHelloPage(screen);
+        RegisterSwipeDetection(screen);
     }
+
+private:
+    // Card 1: a minimal page so swipe navigation has something to show. It is
+    // created last, which puts it above the AI screen, so an opaque background
+    // is enough to cover the UI underneath.
+    void BuildHelloPage(lv_obj_t* screen) {
+        hello_page_ = lv_obj_create(screen);
+        lv_obj_set_size(hello_page_, width_, height_);
+        lv_obj_align(hello_page_, LV_ALIGN_CENTER, 0, 0);
+        lv_obj_set_style_bg_color(hello_page_, lv_color_hex(0x000000), 0);
+        lv_obj_set_style_bg_opa(hello_page_, LV_OPA_COVER, 0);
+        lv_obj_set_style_border_width(hello_page_, 0, 0);
+        lv_obj_set_style_radius(hello_page_, 0, 0);
+        lv_obj_set_scrollbar_mode(hello_page_, LV_SCROLLBAR_MODE_OFF);
+        // Swiping must reach the screen handler instead of scrolling this page.
+        lv_obj_remove_flag(hello_page_, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_add_flag(hello_page_, LV_OBJ_FLAG_HIDDEN);
+
+        lv_obj_t* label = lv_label_create(hello_page_);
+        lv_label_set_text(label, "Hello World");
+        lv_obj_set_style_text_color(label, lv_color_hex(0xFFFFFF), 0);
+        lv_obj_set_style_text_font(label, lv_obj_get_style_text_font(screen, LV_PART_MAIN), 0);
+        lv_obj_set_style_text_align(label, LV_TEXT_ALIGN_CENTER, 0);
+        lv_obj_center(label);
+    }
+
+    // Swipe detection. LVGL's own LV_EVENT_GESTURE is deliberately not used here:
+    // indev_gesture() bails out whenever the pressed object is scrollable
+    // (scroll_obj != NULL) and otherwise only fires on the pressed object unless
+    // LV_OBJ_FLAG_GESTURE_BUBBLE is set. Most of this UI is built with
+    // lv_obj_create(), which is scrollable by default, so the native gesture
+    // would be swallowed. PRESSED/PRESSING/RELEASED bubble to the screen
+    // regardless, which makes this far more predictable.
+    void RegisterSwipeDetection(lv_obj_t* screen) {
+        lv_obj_add_event_cb(screen, SwipeEventCb, LV_EVENT_PRESSED, this);
+        lv_obj_add_event_cb(screen, SwipeEventCb, LV_EVENT_PRESSING, this);
+        lv_obj_add_event_cb(screen, SwipeEventCb, LV_EVENT_RELEASED, this);
+    }
+
+    static void SwipeEventCb(lv_event_t* e) {
+        auto* self = static_cast<CustomLcdDisplay*>(lv_event_get_user_data(e));
+
+        lv_indev_t* indev = lv_indev_active();
+        if (indev == nullptr || lv_indev_get_type(indev) != LV_INDEV_TYPE_POINTER) {
+            return;
+        }
+
+        lv_point_t p;
+        lv_indev_get_point(indev, &p);
+
+        const lv_event_code_t code = lv_event_get_code(e);
+        if (code == LV_EVENT_PRESSED) {
+            self->swipe_start_ = p;
+            self->swipe_last_ = p;
+            self->swiping_ = true;
+        } else if (code == LV_EVENT_PRESSING) {
+            if (self->swiping_) {
+                self->swipe_last_ = p;
+            }
+        } else {  // LV_EVENT_RELEASED
+            if (!self->swiping_) {
+                return;
+            }
+            self->swiping_ = false;
+            const int dx = self->swipe_last_.x - self->swipe_start_.x;
+            const int dy = self->swipe_last_.y - self->swipe_start_.y;
+            self->HandleSwipe(dx, dy);
+        }
+    }
+
+    void HandleSwipe(int dx, int dy) {
+        if (LV_ABS(dx) >= LV_ABS(dy)) {
+            if (LV_ABS(dx) < kSwipeThresholdPx) {
+                return;
+            }
+            // Finger moving left advances, moving right goes back.
+            ESP_LOGI(TAG, "swipe %s dx=%d dy=%d card %d", dx < 0 ? "left" : "right", dx, dy,
+                     card_index_);
+            dx < 0 ? NextCard() : PrevCard();
+        } else if (LV_ABS(dy) >= kSwipeThresholdPx) {
+            // Vertical swipes are reserved for scrolling; logged so a working
+            // touch panel is visible even though nothing happens yet.
+            ESP_LOGI(TAG, "swipe %s dx=%d dy=%d (vertical, unhandled)",
+                     dy < 0 ? "up" : "down", dx, dy);
+        }
+    }
+
+    void ShowCard(int index) {
+        if (index < 0 || index >= kCardCount || index == card_index_) {
+            return;
+        }
+        card_index_ = index;
+        if (hello_page_ == nullptr) {
+            return;
+        }
+        if (card_index_ == 0) {
+            lv_obj_add_flag(hello_page_, LV_OBJ_FLAG_HIDDEN);
+        } else {
+            lv_obj_remove_flag(hello_page_, LV_OBJ_FLAG_HIDDEN);
+        }
+    }
+
+    void NextCard() { ShowCard(card_index_ + 1); }
+    void PrevCard() { ShowCard(card_index_ - 1); }
+
+    lv_obj_t* hello_page_ = nullptr;
+    int card_index_ = 0;
+    bool swiping_ = false;
+    lv_point_t swipe_start_ = {0, 0};
+    lv_point_t swipe_last_ = {0, 0};
 };
 
 class CustomBoard : public WifiBoard {
@@ -153,7 +288,23 @@ private:
         display_ = new CustomLcdDisplay(panel_io, panel,
                                     DISPLAY_WIDTH, DISPLAY_HEIGHT, DISPLAY_OFFSET_X, DISPLAY_OFFSET_Y, DISPLAY_MIRROR_X, DISPLAY_MIRROR_Y, DISPLAY_SWAP_XY);
     }
- 
+
+    // The panel ships with an SPD2010 touch controller: I2C 0x53, INT on IO4
+    // and reset driven by TCA9554 EXIO1 (bit 0). It speaks its own HDP packet
+    // protocol over 16-bit big-endian registers, so none of the esp_lcd_touch_*
+    // drivers bundled with ESP-IDF can drive it - they all read 0xFF back.
+    // touch_spd2010.cc carries the vendor implementation (ported from
+    // demo/ESP-IDF/ESP32-S3-Touch-LCD-1.46-Test/main/Touch_Driver/).
+    void InitializeTouch() {
+        if (!spd2010_touch::Init(i2c_bus_, io_expander)) {
+            ESP_LOGE(TAG, "SPD2010 touch controller not responding");
+            return;
+        }
+        if (!spd2010_touch::Register()) {
+            ESP_LOGE(TAG, "failed to register LVGL touch input device");
+        }
+    }
+
     void InitializeButtonsCustom() {
         gpio_reset_pin(BOOT_BUTTON_GPIO);                                     
         gpio_set_direction(BOOT_BUTTON_GPIO, GPIO_MODE_INPUT);   
@@ -226,6 +377,9 @@ public:
         InitializeTca9554();
         InitializeSpi();
         InitializeSpd2010Display();
+        // Must run after the display exists (the touch input device is attached
+        // to lv_display_get_default) and after I2C is up.
+        InitializeTouch();
         InitializeButtons();
         GetBacklight()->RestoreBrightness();
     }
