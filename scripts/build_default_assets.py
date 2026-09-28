@@ -778,7 +778,19 @@ def get_emoji_collection_path(default_emoji_collection, noto_fonts_path, project
     """
     if not default_emoji_collection:
         return None
-    
+
+    # Board-local collection: a path relative to the project root (for example
+    # "main/boards/<vendor>/<board>/emoji") wins over the built-in collections.
+    if '/' in default_emoji_collection or '\\' in default_emoji_collection:
+        if project_root:
+            board_path = os.path.join(project_root, default_emoji_collection)
+            if os.path.isdir(board_path):
+                return board_path
+            print(f"Warning: Board emoji collection directory not found: {board_path}")
+        else:
+            print("Warning: project_root not provided, cannot locate board emoji collection")
+        return None
+
     # Special handling for otto-gif collection
     if default_emoji_collection == 'otto-gif':
         if project_root:
