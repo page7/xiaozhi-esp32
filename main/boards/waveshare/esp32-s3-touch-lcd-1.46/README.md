@@ -52,9 +52,25 @@ https://www.waveshare.net/shop/ESP32-S3-Touch-LCD-1.46B.htm
   而 `lv_obj_set_pos` 按父对象**内容区**定位（`lv_obj_move_to` 会加
   `space_left/top`），不清零会把四圆整体往右下推 16px（上间隙32、下间隙0，
   表现为"四圆偏下、贴底边"）。
-- **状态栏**：主屏(card0) 顶部有 `top_bar_`（网络/电池图标，半透明）+
-  `status_bar_`（居中状态文字）；第二屏(card1) 的 `sensor_page_` 是 screen 最后
-  创建的 412×412 不透明全屏页，绘制在其上层，**会盖住状态栏**（第二屏看不到）。
+- **读数渲染**：湿度大字 = `lv_font_montserrat_40`（`config.json` 的
+  `sdkconfig_append` 开 `CONFIG_LV_FONT_MONTSERRAT_40/12=y`，build.py 每次全量重生成
+  sdkconfig）。**伪加粗**：4 层同文本按 (0,0)/(1,0)/(0,1)/(1,1) 叠放——LVGL 描边
+  `text_outline_stroke` 只在 `#if LV_USE_FREETYPE && LV_USE_VECTOR_GRAPHIC` 分支生效
+  （位图字体无效，本工程也未开 FREETYPE），必须放进**固定尺寸** 130×48 容器：
+  `LV_SIZE_CONTENT` 只量得到 align x/y 偏移为 0 的副本，会把 +1px 的三层裁掉。
+  圆框按湿度分档：`>20%` 橙 `#FFBB00`、`>30%` 红 `#ff4000`（优先）、否则灰
+  `#555555`，判档在 `RefreshSensorLabels()`；mock 湿度 15~35、初值 {16,24,33,26}
+  以同时展示三档。每圆底部序号 1-4：`LV_OBJ_FLAG_FLOATING` 让 flex 跳过该子对象
+  （`lv_obj_is_layout_positioned` 返回 false），`lv_obj_refr_pos()` 仍按
+  `BOTTOM_MID` 摆位；页面底部中间设置图标 = `font_material_symbols_30_4` +
+  `MATERIAL_SYMBOLS_SETTINGS`（与主屏 emoji 共用同一已链接字体）。
+- **状态栏（整条隐藏，顶部留白）**：主屏(card0) 原本有 `top_bar_`（网络/静音/
+  电池图标）+ `status_bar_`（居中时钟、状态文字、通知），板级 `SetupUI()` 对二者
+  `lv_obj_add_flag(..., HIDDEN)` 后**顶部完全无内容**。时钟/状态/通知的更新链路
+  （`UpdateStatusBar()`/`SetStatus()`/`ShowNotification()`）照常运行，只是画进
+  隐藏对象。`low_battery_popup_` 是 screen 的独立子对象（lcd_display.cc），不在
+  `status_bar_` 内，低电量弹窗仍可弹出；Alert 仍通过 `SetEmotion`+`SetChatMessage`
+  （表情+聊天气泡）可见。第二屏(card1) 的 `sensor_page_` 本就全屏不透明盖住二者。
 
 #### 为什么挂在 indev 事件上（而不是对象事件）
 

@@ -221,3 +221,31 @@ Log:
 - 方案（圆屏）: 可见区 = 412 内切圆 R=206；2×2 网格对角触点 `√2·(d+gap)/2+d/2`。旧 margin16/d184 → 触点 **231 > 206，四角被圆形黑边裁掉**（"太大"的观感来源）。改 `kSensorGridMargin=50` → `d=(412-100-12)/2=150` → 触点 190（内缩16px）；加 `sensor grid: diameter/margin/gap` 日志便于硬件核对
 - 状态栏: 主屏(card0) 有 `top_bar_`（左网络+右静音/电池图标，半透明）+ `status_bar_`（居中状态文字），均为 screen 直接子对象；第二屏(card1) `sensor_page_` 是 screen **最后创建**的 412×412 不透明全屏子对象（LVGL 按创建顺序绘制，后建在上；全仓库无 `move_to_index` 改序）→ 完全盖住状态栏，第二屏顶部不应见状态栏；"偏下"与状态栏无关（是 padding bug）
 - 验证: 编译+clang-format+烧录+启动正常；待目视确认：四圆四边间距对称（50/50/50/50）、四角完整不被圆形黑边裁切、第二屏顶部纯黑无状态栏
+
+### [2026-09-29] 主屏去掉时钟显示
+- 状态: 已被下一条取代（板级 `SetStatus` 过滤实现已随本轮改为整条隐藏而删除；时钟仍被去掉）
+- 范围: main/boards/waveshare/esp32-s3-touch-lcd-1.46/esp32-s3-touch-lcd-1.46.cc、README.md、AGENTS.md
+- 需求: 主屏顶部的时间可以去掉么 → 可以，已去掉
+- 链路: 时钟 = `Application` 1s `CLOCK_TICK` → `LvglDisplay::UpdateStatusBar()`（lvgl_display.cc:218，仅 idle 且时间已同步）→ `strftime("%H:%M")` → `SetStatus(time_str)`（**全仓库唯一 HH:MM 产出点**）→ `status_label_`。`SetStatus` 是 virtual（display.h:43）且 `UpdateStatusBar` 在对象内部虚调用它 → 板级 override 自动生效
+- 方案: 板级 `CustomLcdDisplay::SetStatus` override，只拦**裸 HH:MM 形态**（5 字符、`d d : d d`）→ return 丢弃时钟；其余（`STANDBY`/`LISTENING`/Alert 状态等）透传 `LvglDisplay::SetStatus`。零核心改动；`UpdateStatusBar` 内 mute/电池/网络图标逻辑不受影响。去掉时钟后顶部居中保留最近一条状态文字（zh-CN 下为"待机"）
+- 验证: 编译+clang-format+烧录+启动正常；待目视确认主屏顶部不再出现 HH:MM、状态文字正常
+
+### [2026-09-29] 主屏顶部整条状态区隐藏（"都去掉留空白"）
+- 状态: 已完成（已烧录；待目视确认顶部无任何内容）
+- 范围: main/boards/waveshare/esp32-s3-touch-lcd-1.46/{esp32-s3-touch-lcd-1.46.cc,README.md}、AGENTS.md
+- 需求: 上一条只去时钟后顶部还剩"待机"等状态文字 → "都去掉留空白"（状态文字+左右图标全部不要）
+- 方案: 板级 `SetupUI()` 在父类建完 UI 后直接 `lv_obj_add_flag(top_bar_/status_bar_, HIDDEN)`——**结构性隐藏整条状态区**，时钟/状态文字/通知/图标全部画进隐藏对象，核心 `UpdateStatusBar()/SetStatus()/ShowNotification()` 更新链路零改动（无副作用）。上一条的 `SetStatus` HH:MM 过滤 override **随之删除**（父对象隐藏后冗余，且"status texts yes"注释与新意图矛盾）。已核对：全仓库无任何代码 `remove_flag` 撤销这两个隐藏；非微信样式变体下 `top_bar_`/`status_bar_` 均为 screen 直接子对象
+- 关键事实: `low_battery_popup_` = `lv_obj_create(screen)`（lcd_display.cc:1036），**不在** `status_bar_` 内 → 低电量弹窗不受影响；Alert 的状态文字虽被隐藏，但 `SetEmotion`（表情）+`SetChatMessage`（聊天气泡）仍可见
+- 验证: 编译+clang-format+烧录+启动正常；待目视确认主屏顶部无任何内容（无时钟/待机/图标）
+
+### [2026-09-29] 第二屏仪表盘：40px 湿度+伪加粗+环色三档+序号+设置图标
+- 状态: 已完成（已烧录，75s 监视启动无崩溃；视觉效果待目视确认）
+- 范围: main/boards/waveshare/esp32-s3-touch-lcd-1.46/{esp32-s3-touch-lcd-1.46.cc,config.json,README.md}、AGENTS.md
+- 需求: 湿度字体增大、与温度间距减小、湿度加粗；湿度 >20% 圆框橙 `#FFBB00`、>30% 红 `#ff4000`；每圆底部序号 1-4 小字；页面最底部中间设置图标
+- 方案: `config.json` 的 `sdkconfig_append` 加 `CONFIG_LV_FONT_MONTSERRAT_40/12=y`（build.py 全量重生成 sdkconfig，构建输出可见两行 append）；湿度字换 `lv_font_montserrat_40`（line_height 44），删掉 `font_noto_sans_basic_30_4` 引用（map 0 引用被 GC，xiaozhi.bin 2.87→2.65MB）；`pad_row` 6→2
+- 伪加粗: LVGL `text_outline_stroke` 只在 `#if LV_USE_FREETYPE && LV_USE_VECTOR_GRAPHIC` 内的 `draw_letter_outline` 生效（位图字体走不进，且 CONFIG_LV_USE_FREETYPE is not set）→ 改 4 层同文本 (0,0)/(1,0)/(0,1)/(1,1) 叠放，放**固定尺寸 130×48 容器**（`LV_SIZE_CONTENT` 会只量 x/y=0 的副本把其余裁掉，见 calc_content_width lv_obj_pos.c:1353 对非 layout 子对象按 align 分档处理）；容器清 bg_opa/border/pad/radius/scrollbar/SCROLLABLE
+- 序号定位: `LV_OBJ_FLAG_FLOATING` 让 flex 跳过（lv_flex.c:341/478），`lv_obj_refr_pos()`（lv_obj_pos.c:777）对非 layout_positioned 子对象照常按 `BOTTOM_MID` 摆位，`lv_obj_move_to` 对 FLOATING 用父绝对坐标（lv_obj_pos.c:876）
+- 环色: 判档挂 `RefreshSensorLabels()`（mock 与未来 BLE 都经过），新增 `sensor_circles_[4]` 成员；`lv_style_set_prop` 对同 prop 就地更新（lv_style.c:361），每 3s 调用不涨内存。**阈值按字面挂在湿度**，mock 湿度原 40~70 全 >30 恒红 → 改 15~35、初值 {16,24,33,26} 三档全可见；若阈值本意是温度（20/30℃ 更自然）是一行改动
+- 设置图标: `font_material_symbols_30_4`（lcd_display.cc 已链接）+ `MATERIAL_SYMBOLS_SETTINGS`，`BOTTOM_MID y-8`（y≈374..404，圆屏该处半宽 ≥57px，30px 图标可见），仅在 card1 页面上
+- 坑: 本 LVGL 版本透明度枚举是 `LV_OPA_TRANSP` 不是 `LV_OPA_TRANSPARENT`（首次编译报错已修）；clang-format 本机不在 PATH，pip 装的 clang-format 23.1.1（`E:\pyenv\...\Scripts`）
+- 验证: 编译+clang-format+烧录 COM7+75s 监视：`sensor grid: diameter=150` 正常、`Refreshing display theme`（上次崩溃点）通过、MQTT 连接、无 crash/backtrace；待目视确认四圆 40px 加粗湿度、三档环色、序号 1-4、底部齿轮图标

@@ -15,6 +15,7 @@
 #include <esp_random.h>
 #include <esp_timer.h>
 #include <iot_button.h>
+#include <material_symbols.h>
 #include <algorithm>
 #include <cstdio>
 #include <cstring>
@@ -43,8 +44,25 @@ constexpr int kSensorCount = 4;
 constexpr int kSensorGridMargin = 50;
 constexpr int kSensorGridGap = 12;
 
-// Bigger than the theme's 16 px text font for the humidity readout.
-LV_FONT_DECLARE(font_noto_sans_basic_30_4);
+// Tight gap between the temperature line and the humidity readout inside
+// each circle (was 6px before the readout got its own box).
+constexpr int kSensorRowGap = 2;
+
+// Humidity readout box: fixed size, holds the four overlapping copies that
+// fake bold text (see BuildSensorPage). Must be fixed - LV_SIZE_CONTENT
+// would measure only the copies whose align offset is 0 and clip the rest.
+constexpr int kHumBoxWidth = 130;
+constexpr int kHumBoxHeight = 48;
+constexpr int kHumBoldLayers = 4;  // pixel offsets (0,0) (1,0) (0,1) (1,1)
+
+// Humidity ring thresholds: >20% orange, >30% red (red wins), else grey.
+constexpr float kHumidityOrange = 20.0f;
+constexpr float kHumidityRed = 30.0f;
+
+// Settings gear at the bottom centre of card 1. font_material_symbols_30_4
+// is already linked through lcd_display.cc; the Montserrat sizes come from
+// config.json sdkconfig_append (CONFIG_LV_FONT_MONTSERRAT_40/12=y).
+LV_FONT_DECLARE(font_material_symbols_30_4);
 
 // 在waveshare_lcd_1_46类之前添加新的显示类
 class CustomLcdDisplay : public SpiLcdDisplay {
@@ -85,6 +103,15 @@ public:
 
         DisplayLockGuard lock(this);
         lv_display_add_event_cb(display_, rounder_event_cb, LV_EVENT_INVALIDATE_AREA, NULL);
+
+        // Round-screen main UI keeps the top strip blank: hide the icon bar
+        // (network/mute/battery) and the status bar carrying the clock, status
+        // texts and notifications. Their update paths (UpdateStatusBar /
+        // SetStatus / ShowNotification) keep running - they just draw into
+        // hidden objects. low_battery_popup_ is a separate child of the screen
+        // (lcd_display.cc), so the low-battery warning still pops up.
+        lv_obj_add_flag(top_bar_, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_add_flag(status_bar_, LV_OBJ_FLAG_HIDDEN);
 
         lv_obj_t* screen = lv_screen_active();
         BuildSensorPage(screen);
@@ -167,13 +194,14 @@ private:
             lv_obj_set_style_border_color(circle, lv_color_hex(0x555555), 0);
             lv_obj_set_style_border_width(circle, 2, 0);
             lv_obj_set_style_pad_all(circle, 0, 0);
-            lv_obj_set_style_pad_row(circle, 6, 0);
+            lv_obj_set_style_pad_row(circle, kSensorRowGap, 0);
             lv_obj_set_scrollbar_mode(circle, LV_SCROLLBAR_MODE_OFF);
             lv_obj_remove_flag(circle, LV_OBJ_FLAG_SCROLLABLE);
             // Temperature sits above the big humidity value, pair centered.
             lv_obj_set_flex_flow(circle, LV_FLEX_FLOW_COLUMN);
             lv_obj_set_flex_align(circle, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER,
                                   LV_FLEX_ALIGN_CENTER);
+            sensor_circles_[i] = circle;
 
             sensor_temp_labels_[i] = lv_label_create(circle);
             // Deliberately no explicit font here: LV_STYLE_TEXT_FONT is
@@ -185,10 +213,54 @@ private:
             // (boot-loop with InstrFetchProhibited at PC=0).
             lv_obj_set_style_text_color(sensor_temp_labels_[i], lv_color_hex(0xB0B0B0), 0);
 
-            sensor_humidity_labels_[i] = lv_label_create(circle);
-            lv_obj_set_style_text_font(sensor_humidity_labels_[i], &font_noto_sans_basic_30_4, 0);
-            lv_obj_set_style_text_color(sensor_humidity_labels_[i], lv_color_hex(0xFFFFFF), 0);
+            // Humidity readout: a fixed-size box holding four copies of the
+            // same text at pixel offsets (0,0)/(1,0)/(0,1)/(1,1) - a 2x2
+            // dilation that fakes bold. LVGL's text outline stroke only
+            // renders for FreeType vector glyphs (draw_letter_outline sits
+            // behind `#if LV_USE_FREETYPE && LV_USE_VECTOR_GRAPHIC`) and
+            // CONFIG_LV_USE_FREETYPE is off, so stacking copies is the only
+            // way to embolden a built-in bitmap font.
+            lv_obj_t* hum_box = lv_obj_create(circle);
+            lv_obj_set_size(hum_box, kHumBoxWidth, kHumBoxHeight);
+            lv_obj_set_style_bg_opa(hum_box, LV_OPA_TRANSP, 0);
+            lv_obj_set_style_border_width(hum_box, 0, 0);
+            lv_obj_set_style_radius(hum_box, 0, 0);
+            lv_obj_set_style_pad_all(hum_box, 0, 0);
+            lv_obj_set_scrollbar_mode(hum_box, LV_SCROLLBAR_MODE_OFF);
+            lv_obj_remove_flag(hum_box, LV_OBJ_FLAG_SCROLLABLE);
+            for (int k = 0; k < kHumBoldLayers; ++k) {
+                lv_obj_t* label = lv_label_create(hum_box);
+                // Static built-in font: flash-resident, immune to the theme
+                // font swap described above.
+                lv_obj_set_style_text_font(label, &lv_font_montserrat_40, 0);
+                lv_obj_set_style_text_color(label, lv_color_hex(0xFFFFFF), 0);
+                lv_obj_align(label, LV_ALIGN_CENTER, k & 1, (k >> 1) & 1);
+                sensor_humidity_labels_[i][k] = label;
+            }
+
+            // Sequence number pinned to the circle's bottom edge. FLOATING
+            // makes flex skip the child (lv_obj_is_layout_positioned()
+            // returns false for LV_OBJ_FLAG_FLOATING) while lv_obj_refr_pos()
+            // still applies the BOTTOM_MID align against the circle.
+            lv_obj_t* index_label = lv_label_create(circle);
+            lv_obj_add_flag(index_label, LV_OBJ_FLAG_FLOATING);
+            lv_obj_set_style_text_font(index_label, &lv_font_montserrat_12, 0);
+            lv_obj_set_style_text_color(index_label, lv_color_hex(0x888888), 0);
+            char index_buf[4];
+            snprintf(index_buf, sizeof(index_buf), "%d", i + 1);
+            lv_label_set_text(index_label, index_buf);
+            lv_obj_align(index_label, LV_ALIGN_BOTTOM_MID, 0, -6);
+            sensor_index_labels_[i] = index_label;
         }
+
+        // Settings gear at the bottom centre of the page. On the round panel
+        // y~400 still leaves ~57px of visible half-width, enough for the
+        // ~30px icon; sits 12px below the bottom circles (grid ends at 362).
+        lv_obj_t* settings_icon = lv_label_create(sensor_page_);
+        lv_obj_set_style_text_font(settings_icon, &font_material_symbols_30_4, 0);
+        lv_obj_set_style_text_color(settings_icon, lv_color_hex(0xAAAAAA), 0);
+        lv_label_set_text(settings_icon, MATERIAL_SYMBOLS_SETTINGS);
+        lv_obj_align(settings_icon, LV_ALIGN_BOTTOM_MID, 0, -8);
 
         for (int i = 0; i < kSensorCount; ++i) {
             RefreshSensorLabels(i);
@@ -203,7 +275,22 @@ private:
         snprintf(buf, sizeof(buf), "%.1f°C", sensor_readings_[index].temperature_c);
         lv_label_set_text(sensor_temp_labels_[index], buf);
         snprintf(buf, sizeof(buf), "%.0f%%", sensor_readings_[index].humidity_percent);
-        lv_label_set_text(sensor_humidity_labels_[index], buf);
+        for (int k = 0; k < kHumBoldLayers; ++k) {
+            lv_label_set_text(sensor_humidity_labels_[index][k], buf);
+        }
+        // Ring colour follows humidity: red above 30%, orange above 20%,
+        // grey otherwise (red checked last so it wins over orange).
+        // lv_style_set_prop() updates the local prop in place, so calling
+        // this every refresh does not grow the style list.
+        const float humidity = sensor_readings_[index].humidity_percent;
+        lv_color_t ring = lv_color_hex(0x555555);
+        if (humidity > kHumidityOrange) {
+            ring = lv_color_hex(0xFFBB00);
+        }
+        if (humidity > kHumidityRed) {
+            ring = lv_color_hex(0xff4000);
+        }
+        lv_obj_set_style_border_color(sensor_circles_[index], ring, 0);
     }
 
     static void MockSensorTimerCb(lv_timer_t* timer) {
@@ -213,9 +300,12 @@ private:
                 std::clamp(self->sensor_readings_[i].temperature_c +
                                (static_cast<int>(esp_random() % 5) - 2) * 0.1f,
                            20.0f, 30.0f);
+            // Mock humidity spans the three ring tiers (<=20 grey,
+            // 20-30 orange, >30 red) so all colours are visible until the
+            // real BLE readings arrive.
             const float humidity = std::clamp(self->sensor_readings_[i].humidity_percent +
                                                   (static_cast<int>(esp_random() % 5) - 2) * 0.5f,
-                                              40.0f, 70.0f);
+                                              15.0f, 35.0f);
             self->SetSensorReading(i, temperature, humidity);
         }
     }
@@ -287,9 +377,11 @@ private:
     void PrevCard() { ShowCard(card_index_ - 1); }
 
     SensorReading sensor_readings_[kSensorCount] = {
-        {25.3f, 52.0f}, {24.8f, 56.0f}, {26.1f, 47.0f}, {23.9f, 61.0f}};
+        {25.3f, 16.0f}, {24.8f, 24.0f}, {26.1f, 33.0f}, {23.9f, 26.0f}};
     lv_obj_t* sensor_temp_labels_[kSensorCount] = {};
-    lv_obj_t* sensor_humidity_labels_[kSensorCount] = {};
+    lv_obj_t* sensor_circles_[kSensorCount] = {};
+    lv_obj_t* sensor_humidity_labels_[kSensorCount][kHumBoldLayers] = {};
+    lv_obj_t* sensor_index_labels_[kSensorCount] = {};
     lv_obj_t* sensor_page_ = nullptr;
     lv_timer_t* sensor_mock_timer_ = nullptr;
     lv_indev_t* touch_indev_ = nullptr;

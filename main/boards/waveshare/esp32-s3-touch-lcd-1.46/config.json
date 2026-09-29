@@ -5,7 +5,10 @@
     "builds": [
         {
             "name": "esp32-s3-touch-lcd-1.46",
-            "sdkconfig_append": []
+            "sdkconfig_append": [
+                "CONFIG_LV_FONT_MONTSERRAT_40=y",
+                "CONFIG_LV_FONT_MONTSERRAT_12=y"
+            ]
         }
     ]
 }
