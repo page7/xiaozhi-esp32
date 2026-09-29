@@ -194,3 +194,12 @@ Log:
 - 关键决策: **不使用 LVGL 原生 `LV_EVENT_GESTURE`**——查源码 `indev_gesture()` 在 `scroll_obj != NULL` 时直接 return（滚动优先），否则只发给被按对象、需 `LV_OBJ_FLAG_GESTURE_BUBBLE` 才冒泡；而本 UI 大量用 `lv_obj_create()`（默认可滚动），原生手势会被吞掉。改用手动检测 `PRESSED/PRESSING/RELEASED`（这三个冒泡到 screen、不受滚动影响），横向阈值 `kSwipeThresholdPx=60`（约屏宽 15%）
 - 手势映射: 横向左滑→下一张卡、右滑→返回；纵向暂不处理但会打日志，便于验证触摸在四个方向都工作
 - 验证: 目标板编译通过；待烧录确认滑动切换页面与日志 `swipe left/right dx=.. card ..`，以及纵向 `swipe up/down` 是否触发
+
+### [2026-09-28] 左滑第二页改为四圆温湿度仪表盘（模拟数据）
+- 状态: 已完成（已烧录，启动稳定无崩溃；页面布局/滑动手势待肉眼确认）
+- 范围: main/boards/waveshare/esp32-s3-touch-lcd-1.46/esp32-s3-touch-lcd-1.46.cc、AGENTS.md
+- 需求: 左滑出现第二页，页面黑底，显示四个等大圆圈；每圆圈内大字显示湿度、上方小字显示温度；先用模拟数据，后面要对接蓝牙设备读数
+- 方案: 复用上一轮的滑动卡片框架，card 1 的 `BuildHelloPage()` 换成 `BuildSensorPage()`（hello world 页退役）。2×2 等大圆圈（直径由 width_ 推算，margin 16/gap 12，184px），圆 #161616 填充 + 2px #555 描边；圆内 flex 纵向居中：上=温度小字（主题 16px 字体，`%.1f°C`），下=湿度大字（新链入 `font_noto_sans_basic_30_4`，`%.0f%%`，30px 为组件内最大 noto sans basic）。数据层 `SetSensorReading(index, temp, humidity)` 内部取 `DisplayLockGuard`（esp_lvgl_port 的 lvgl_mux 是递归锁，lv_timer 内调用不死锁；后续 BLE 回调可从任意任务调用），另有 3s `lv_timer` 随机游动生成模拟值（温 20~30℃、湿 40~70%）走同一更新路径。°(U+00B0) 已确认在字体 cmap 范围 161~255 内
+- 首次烧录崩溃（boot loop，已修复）: `Guru Meditation InstrFetchProhibited PC=0`，栈在 `lv_font_get_glyph_width`。根因：温度 label 用 `lv_obj_set_style_text_font(label, lv_obj_get_style_text_font(screen,...))` **显式捕获 theme 字体裸指针**，而 `LvglBuiltInFont::font_` 是堆上 shared_ptr 拷贝；WiFi 连上后 `Assets::LvglStrategy::Apply → SetTextFont()` 把主题字体换成 assets cbin 字体并 `previous_font.reset()` 释放旧对象（`LcdDisplay::SetTheme` 只回绑核心 widget，不认板级新建 label），下一次 `lv_display_refr_timer` 布局测量温度 label 即跳进已释放内存（0x3fceb66c，DRAM，A4=0x32='2' 正是 "25.3°C" 的首字符）。**修复：删除该显式字体设置**——`LV_STYLE_TEXT_FONT` 是可继承样式（`lv_style.c:122`），label 自动继承 screen 字体，SetTheme 换字体后所有继承者拿到新指针，永不悬空。湿度大字用静态 `&font_noto_sans_basic_30_4`（flash）不受影响。坑：板级 label 一律不要 `lv_obj_get_style_text_font()` 存裸指针，要么继承、要么静态字体
+- 开销: 引入 30px 字体使 xiaozhi.bin 2.70→2.87MB（+约 197KB），app 分区仍余 29%
+- 验证: 编译+clang-format 通过；烧录后 60s 监视：启动无崩溃、`Refreshing display theme` 原崩溃点通过、MQTT 连上、进入 idle、触摸 press/release 日志正常；待肉眼确认四圆布局、°C/% 字形、模拟值每 3s 变化、左滑/右滑切换
