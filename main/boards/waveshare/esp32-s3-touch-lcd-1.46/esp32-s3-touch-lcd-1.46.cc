@@ -34,8 +34,13 @@ constexpr int kCardCount = 2;
 constexpr int kSwipeThresholdPx = 60;
 
 // Sensor dashboard (card 1): 2x2 grid of equal circles on a black page.
+// The panel is ROUND: the visible area is the circle inscribed in the
+// 412x412 framebuffer (R = width_/2 = 206). A corner circle of the grid
+// reaches sqrt(2)*(d+gap)/2 + d/2 from the panel centre, so margin 16 with
+// d=184 reached 231px and got clipped by the round bezel; margin 50 gives
+// d=(412-100-12)/2=150, reach 190px, ~16px inside the visible edge.
 constexpr int kSensorCount = 4;
-constexpr int kSensorGridMargin = 16;
+constexpr int kSensorGridMargin = 50;
 constexpr int kSensorGridGap = 12;
 
 // Bigger than the theme's 16 px text font for the humidity readout.
@@ -135,6 +140,12 @@ private:
         lv_obj_set_style_bg_opa(sensor_page_, LV_OPA_COVER, 0);
         lv_obj_set_style_border_width(sensor_page_, 0, 0);
         lv_obj_set_style_radius(sensor_page_, 0, 0);
+        // The default theme gives every lv_obj the `card` style with
+        // pad_all(PAD_DEF) = 16px, and lv_obj_set_pos() positions children
+        // inside the padded content area (lv_obj_move_to adds space_left/top).
+        // Without this the whole grid sat 16px down-right (top gap 32, bottom
+        // gap 0 - circles touched the bottom edge).
+        lv_obj_set_style_pad_all(sensor_page_, 0, 0);
         lv_obj_set_scrollbar_mode(sensor_page_, LV_SCROLLBAR_MODE_OFF);
         // Swipe detection lives on the touch indev's event list, so scrolling
         // state is irrelevant here; still keep the page non-scrollable so a
@@ -143,6 +154,8 @@ private:
         lv_obj_add_flag(sensor_page_, LV_OBJ_FLAG_HIDDEN);
 
         const int diameter = (width_ - 2 * kSensorGridMargin - kSensorGridGap) / 2;
+        ESP_LOGI(TAG, "sensor grid: diameter=%d margin=%d gap=%d", diameter, kSensorGridMargin,
+                 kSensorGridGap);
         for (int i = 0; i < kSensorCount; ++i) {
             lv_obj_t* circle = lv_obj_create(sensor_page_);
             lv_obj_set_size(circle, diameter, diameter);

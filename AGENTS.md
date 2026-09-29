@@ -205,10 +205,19 @@ Log:
 - 验证: 编译+clang-format 通过；烧录后 60s 监视：启动无崩溃、`Refreshing display theme` 原崩溃点通过、MQTT 连上、进入 idle、触摸 press/release 日志正常；待肉眼确认四圆布局、°C/% 字形、模拟值每 3s 变化、左滑/右滑切换
 
 ### [2026-09-29] 滑动手势修复：对象级事件改挂 indev 事件列表
-- 状态: 已完成（已烧录；待用户滑动验证）
+- 状态: 已完成（硬件验证通过：左/右滑切换第二屏正常）
 - 范围: main/boards/waveshare/esp32-s3-touch-lcd-1.46/{esp32-s3-touch-lcd-1.46.cc,touch_spd2010.h,touch_spd2010.cc,README.md}、AGENTS.md
 - 需求: 硬件验证发现 press/release 日志正常但左滑不切换页面、温湿度计页不出现
 - 根因: 对象级 `LV_EVENT_PRESSED/PRESSING/RELEASED` 只发给 hit-test 命中的对象（`container_` 等），`event_send_core()`（lv_obj_event.c:434）向上冒泡要求链条上每个对象带 `LV_OBJ_FLAG_EVENT_BUBBLE`——全仓库 0 处设置 → 注册在 screen 上的 `SwipeEventCb` **从未被调用**（上一轮"这三个冒泡到 screen"的假设错误，当时未硬件验证）
 - 方案: 改用 **indev 级** `lv_indev_add_event_cb(indev, cb, filter, this)`：`send_event()`（lv_indev.c:1892/1900）把 `PRESSED`/`RELEASED` 无条件、先于对象分发转发到 indev 自身事件列表，不依赖命中对象与滚动状态。`PRESSING` 不在转发名单 → 手势按**按下点→抬手点差值**计算。配套：`touch_spd2010::Register()` 改返回 `lv_indev_t*`、release 日志带最后接触坐标（`s_last_x/y` 释放时保留）、`InitializeTouch()` 拿到 indev 后调 `display_->RegisterSwipeDetection(indev)`（`display_` 成员类型改为 `CustomLcdDisplay*`）、`HandleSwipe` 先无条件打印 `touch release dx= dy=` 便于调阈值
 - 排查确认: `wait_until_release` 仅对象删除时置位（lv_obj_tree.c），正常滑动不影响 release 送达；`LV_USE_GESTURE_RECOGNITION` 依赖 `LV_USE_FLOAT`（未启用）无干扰
-- 验证: 目标板编译+clang-format 通过、烧录成功；待用户滑动确认 `touch release dx=..`/`swipe left .. card 1` 日志与页面切换
+- 验证: 目标板编译+clang-format 通过、烧录成功；2026-09-29 用户确认左滑/右滑切换正常（indev 级 `PRESSED/RELEASED` + 起终点差值方案有效）
+
+### [2026-09-29] 第二屏布局微调：圆形屏适配 + 修 padding 导致的偏下
+- 状态: 已完成（已烧录；待硬件目视确认四圆对称/不被裁切/第二屏无状态栏）
+- 范围: main/boards/waveshare/esp32-s3-touch-lcd-1.46/{esp32-s3-touch-lcd-1.46.cc,README.md}、AGENTS.md
+- 需求: 四个圆太大（1.46 是圆形屏，需按可见圆布局）；四圆整体偏下；问屏幕顶部是否有状态栏
+- 根因（偏下）: LVGL 默认主题随 display **自动**初始化（`lv_display.c:132`，`CONFIG_LV_USE_THEME_DEFAULT=y`）→ 每个 `lv_obj_create()` 经 `theme_apply` 套上 `card` 样式 = `pad_all(PAD_DEF)`（DPI130/DISP_MEDIUM → `(130*20+80)/160` = **16px**）；`lv_obj_set_pos` 按父对象**内容区**定位（`lv_obj_move_to` 加 `space_left/top`），`sensor_page_` 漏了清零 → 四圆整体右下移 16px：上间隙32、**下间隙0（贴屏幕底边）**。修复：`lv_obj_set_style_pad_all(sensor_page_, 0, 0)`（圆 `circle` 本来就有）
+- 方案（圆屏）: 可见区 = 412 内切圆 R=206；2×2 网格对角触点 `√2·(d+gap)/2+d/2`。旧 margin16/d184 → 触点 **231 > 206，四角被圆形黑边裁掉**（"太大"的观感来源）。改 `kSensorGridMargin=50` → `d=(412-100-12)/2=150` → 触点 190（内缩16px）；加 `sensor grid: diameter/margin/gap` 日志便于硬件核对
+- 状态栏: 主屏(card0) 有 `top_bar_`（左网络+右静音/电池图标，半透明）+ `status_bar_`（居中状态文字），均为 screen 直接子对象；第二屏(card1) `sensor_page_` 是 screen **最后创建**的 412×412 不透明全屏子对象（LVGL 按创建顺序绘制，后建在上；全仓库无 `move_to_index` 改序）→ 完全盖住状态栏，第二屏顶部不应见状态栏；"偏下"与状态栏无关（是 padding bug）
+- 验证: 编译+clang-format+烧录+启动正常；待目视确认：四圆四边间距对称（50/50/50/50）、四角完整不被圆形黑边裁切、第二屏顶部纯黑无状态栏

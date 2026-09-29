@@ -44,6 +44,17 @@ https://www.waveshare.net/shop/ESP32-S3-Touch-LCD-1.46B.htm
   `emoji_box_` 的显隐状态管理。
 - **方向**：横向左滑 → 下一张卡，右滑 → 返回；纵向暂不处理但会打日志。
   阈值 `kSwipeThresholdPx = 60`（约屏宽 15%）。
+- **布局（圆形屏）**：可见区是 412×412 的内切圆（R=206），2×2 网格的对角触点
+  `√2·(d+gap)/2 + d/2` 必须小于 R，否则四角被圆形黑边裁掉——
+  `kSensorGridMargin = 50` → `d = (412-100-12)/2 = 150`，触点 190px，内缩 16px。
+- **padding 坑**：`sensor_page_` 必须 `lv_obj_set_style_pad_all(_, 0, 0)`——
+  LVGL 默认主题给每个 `lv_obj_create` 套 `card` 样式（`PAD_DEF`=16px），
+  而 `lv_obj_set_pos` 按父对象**内容区**定位（`lv_obj_move_to` 会加
+  `space_left/top`），不清零会把四圆整体往右下推 16px（上间隙32、下间隙0，
+  表现为"四圆偏下、贴底边"）。
+- **状态栏**：主屏(card0) 顶部有 `top_bar_`（网络/电池图标，半透明）+
+  `status_bar_`（居中状态文字）；第二屏(card1) 的 `sensor_page_` 是 screen 最后
+  创建的 412×412 不透明全屏页，绘制在其上层，**会盖住状态栏**（第二屏看不到）。
 
 #### 为什么挂在 indev 事件上（而不是对象事件）
 
