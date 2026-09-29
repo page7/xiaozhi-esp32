@@ -15,8 +15,8 @@ namespace {
 const char* TAG = "Touch_SPD2010";
 
 constexpr uint8_t kAddr = 0x53;
-constexpr int kInitTimeoutMs = 1000;   // vendor demo used 1 s
-constexpr int kPollTimeoutMs = 100;    // keep the LVGL task responsive
+constexpr int kInitTimeoutMs = 1000;  // vendor demo used 1 s
+constexpr int kPollTimeoutMs = 100;   // keep the LVGL task responsive
 constexpr uint32_t kMaxPoints = 5;
 
 // The I2C device handle for kAddr is created once in Init() and then reused;
@@ -170,8 +170,7 @@ esp_err_t ReadTpHdp(const tp_status_t* status, SPD2010_Touch* touch) {
         for (uint8_t i = 0; i < touch->touch_num; i++) {
             const uint8_t offset = i * 6;
             touch->rpt[i].id = data[4 + offset];
-            touch->rpt[i].x =
-                ((data[7 + offset] & 0xF0) << 4) | data[5 + offset];
+            touch->rpt[i].x = ((data[7 + offset] & 0xF0) << 4) | data[5 + offset];
             touch->rpt[i].y = ((data[7 + offset] & 0x0F) << 8) | data[6 + offset];
             touch->rpt[i].weight = data[8 + offset];
         }
@@ -303,7 +302,9 @@ void ReadCb(lv_indev_t* /*indev*/, lv_indev_data_t* data) {
         s_last_x = x[0];
         s_last_y = y[0];
     } else if (s_pressed) {
-        ESP_LOGI(TAG, "release");
+        // s_last_x/y are kept on release, so this is the last contact
+        // position - exactly the swipe endpoint the gesture code needs.
+        ESP_LOGI(TAG, "release (%u, %u)", s_last_x, s_last_y);
         s_pressed = false;
     }
 
@@ -312,7 +313,7 @@ void ReadCb(lv_indev_t* /*indev*/, lv_indev_data_t* data) {
     data->state = s_pressed ? LV_INDEV_STATE_PRESSED : LV_INDEV_STATE_RELEASED;
 }
 
-}  // namespace anonymous
+}  // namespace
 
 bool Init(i2c_master_bus_handle_t i2c_bus, esp_io_expander_handle_t io_expander) {
     if (i2c_bus == nullptr || io_expander == nullptr) {
@@ -349,11 +350,11 @@ bool Init(i2c_master_bus_handle_t i2c_bus, esp_io_expander_handle_t io_expander)
     return true;
 }
 
-bool Register() {
+lv_indev_t* Register() {
     lv_indev_t* indev = lv_indev_create();
     if (indev == nullptr) {
         ESP_LOGE(TAG, "cannot create LVGL input device");
-        return false;
+        return nullptr;
     }
     lv_indev_set_type(indev, LV_INDEV_TYPE_POINTER);
     lv_indev_set_read_cb(indev, ReadCb);
@@ -361,7 +362,7 @@ bool Register() {
         lv_indev_set_display(indev, lv_display_get_default());
     }
     ESP_LOGI(TAG, "LVGL pointer input device registered");
-    return true;
+    return indev;
 }
 
 }  // namespace spd2010_touch

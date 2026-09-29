@@ -191,9 +191,9 @@ Log:
 - 范围: main/boards/waveshare/esp32-s3-touch-lcd-1.46/esp32-s3-touch-lcd-1.46.cc
 - 需求: 上一需求的后续——上一轮触摸成功后，滑动切换功能卡，先做一个 hello world 页面
 - 方案: 全部放在板子层 `CustomLcdDisplay`，不动核心 `lcd_display.cc`（本板是唯一有触摸的，改核心会影响 171 个 variant）。卡片模型 `kCardCount=2`：card 0 = 原生 AI 主屏，card 1 = `BuildHelloPage()` 建的满屏黑底页面（最后创建所以层级在最上，只需不透明即可盖住主屏）；`ShowCard/NextCard/PrevCard` 只切换该页的 HIDDEN 标志，**不隐藏主屏子对象**，避免破坏 SetEmotion/SetPreviewImage 对 emoji_box_ 的显隐状态
-- 关键决策: **不使用 LVGL 原生 `LV_EVENT_GESTURE`**——查源码 `indev_gesture()` 在 `scroll_obj != NULL` 时直接 return（滚动优先），否则只发给被按对象、需 `LV_OBJ_FLAG_GESTURE_BUBBLE` 才冒泡；而本 UI 大量用 `lv_obj_create()`（默认可滚动），原生手势会被吞掉。改用手动检测 `PRESSED/PRESSING/RELEASED`（这三个冒泡到 screen、不受滚动影响），横向阈值 `kSwipeThresholdPx=60`（约屏宽 15%）
+- 关键决策: ~~不使用 LVGL 原生 `LV_EVENT_GESTURE`~~ 后半句 **已证伪**：原生 gesture 确不可用（`indev_gesture()` 在 `scroll_obj != NULL` 时直接 return），但"PRESSED/PRESSING/RELEASED 这三个冒泡到 screen"是错的——`event_send_core()` 冒泡要求链条上每个对象带 `LV_OBJ_FLAG_EVENT_BUBBLE`，全仓库 0 处设置，对象级回调从未触发。正确方案见 2026-09-29 条（indev 级 `lv_indev_add_event_cb`）
 - 手势映射: 横向左滑→下一张卡、右滑→返回；纵向暂不处理但会打日志，便于验证触摸在四个方向都工作
-- 验证: 目标板编译通过；待烧录确认滑动切换页面与日志 `swipe left/right dx=.. card ..`，以及纵向 `swipe up/down` 是否触发
+- 验证: 编译通过；2026-09-29 首次烧录硬件验证**证伪手势实现**（press/release 正常但页面不切换），已修复，见下条
 
 ### [2026-09-28] 左滑第二页改为四圆温湿度仪表盘（模拟数据）
 - 状态: 已完成（已烧录，启动稳定无崩溃；页面布局/滑动手势待肉眼确认）
@@ -203,3 +203,12 @@ Log:
 - 首次烧录崩溃（boot loop，已修复）: `Guru Meditation InstrFetchProhibited PC=0`，栈在 `lv_font_get_glyph_width`。根因：温度 label 用 `lv_obj_set_style_text_font(label, lv_obj_get_style_text_font(screen,...))` **显式捕获 theme 字体裸指针**，而 `LvglBuiltInFont::font_` 是堆上 shared_ptr 拷贝；WiFi 连上后 `Assets::LvglStrategy::Apply → SetTextFont()` 把主题字体换成 assets cbin 字体并 `previous_font.reset()` 释放旧对象（`LcdDisplay::SetTheme` 只回绑核心 widget，不认板级新建 label），下一次 `lv_display_refr_timer` 布局测量温度 label 即跳进已释放内存（0x3fceb66c，DRAM，A4=0x32='2' 正是 "25.3°C" 的首字符）。**修复：删除该显式字体设置**——`LV_STYLE_TEXT_FONT` 是可继承样式（`lv_style.c:122`），label 自动继承 screen 字体，SetTheme 换字体后所有继承者拿到新指针，永不悬空。湿度大字用静态 `&font_noto_sans_basic_30_4`（flash）不受影响。坑：板级 label 一律不要 `lv_obj_get_style_text_font()` 存裸指针，要么继承、要么静态字体
 - 开销: 引入 30px 字体使 xiaozhi.bin 2.70→2.87MB（+约 197KB），app 分区仍余 29%
 - 验证: 编译+clang-format 通过；烧录后 60s 监视：启动无崩溃、`Refreshing display theme` 原崩溃点通过、MQTT 连上、进入 idle、触摸 press/release 日志正常；待肉眼确认四圆布局、°C/% 字形、模拟值每 3s 变化、左滑/右滑切换
+
+### [2026-09-29] 滑动手势修复：对象级事件改挂 indev 事件列表
+- 状态: 已完成（已烧录；待用户滑动验证）
+- 范围: main/boards/waveshare/esp32-s3-touch-lcd-1.46/{esp32-s3-touch-lcd-1.46.cc,touch_spd2010.h,touch_spd2010.cc,README.md}、AGENTS.md
+- 需求: 硬件验证发现 press/release 日志正常但左滑不切换页面、温湿度计页不出现
+- 根因: 对象级 `LV_EVENT_PRESSED/PRESSING/RELEASED` 只发给 hit-test 命中的对象（`container_` 等），`event_send_core()`（lv_obj_event.c:434）向上冒泡要求链条上每个对象带 `LV_OBJ_FLAG_EVENT_BUBBLE`——全仓库 0 处设置 → 注册在 screen 上的 `SwipeEventCb` **从未被调用**（上一轮"这三个冒泡到 screen"的假设错误，当时未硬件验证）
+- 方案: 改用 **indev 级** `lv_indev_add_event_cb(indev, cb, filter, this)`：`send_event()`（lv_indev.c:1892/1900）把 `PRESSED`/`RELEASED` 无条件、先于对象分发转发到 indev 自身事件列表，不依赖命中对象与滚动状态。`PRESSING` 不在转发名单 → 手势按**按下点→抬手点差值**计算。配套：`touch_spd2010::Register()` 改返回 `lv_indev_t*`、release 日志带最后接触坐标（`s_last_x/y` 释放时保留）、`InitializeTouch()` 拿到 indev 后调 `display_->RegisterSwipeDetection(indev)`（`display_` 成员类型改为 `CustomLcdDisplay*`）、`HandleSwipe` 先无条件打印 `touch release dx= dy=` 便于调阈值
+- 排查确认: `wait_until_release` 仅对象删除时置位（lv_obj_tree.c），正常滑动不影响 release 送达；`LV_USE_GESTURE_RECOGNITION` 依赖 `LV_USE_FLOAT`（未启用）无干扰
+- 验证: 目标板编译+clang-format 通过、烧录成功；待用户滑动确认 `touch release dx=..`/`swipe left .. card 1` 日志与页面切换

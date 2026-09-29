@@ -3,6 +3,7 @@
 #include <driver/i2c_master.h>
 #include <esp_err.h>
 #include <esp_io_expander.h>
+#include <lvgl.h>
 
 // Vendor SPD2010 touch driver for the ESP32-S3-Touch-LCD-1.46 panel, ported
 // from demo/ESP-IDF/ESP32-S3-Touch-LCD-1.46-Test/main/Touch_Driver/.
@@ -27,7 +28,8 @@ namespace spd2010_touch {
 bool Init(i2c_master_bus_handle_t i2c_bus, esp_io_expander_handle_t io_expander);
 
 // Register the controller as an LVGL pointer input device. Requires Init() to
-// have succeeded first.
-bool Register();
+// have succeeded first. Returns the created indev so the caller can attach
+// indev-level event callbacks (lv_indev_add_event_cb); nullptr on failure.
+lv_indev_t* Register();
 
 }  // namespace spd2010_touch

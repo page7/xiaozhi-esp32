@@ -29,27 +29,39 @@ https://www.waveshare.net/shop/ESP32-S3-Touch-LCD-1.46B.htm
 
 - HDP 数据寄存器是 `0x0003`（厂商算式 `(b0<<8)|b1`，**高字节在前**）。写成 `0x0300` 会因字节序反了导致按屏无数据，且日志看起来一切正常。
 - 启动时 `Touch_SPD2010: fw: ...` 打印固件版本；末尾出现 ASCII 片段即代表芯片应答。
-- `press (x, y)` / `release` 日志为按屏边沿，手势开发期保留，之后可降为 `ESP_LOGD`。
+- `press (x, y)` / `release (x, y)` 日志为按屏边沿（release 显示最后接触点，即手势终点），手势开发期保留，之后可降为 `ESP_LOGD`。
 
 ### 手势与功能卡
 
 固件本身没有任何滑动手势实现（全仓库 0 处 `LV_EVENT_GESTURE`），本板在
 `CustomLcdDisplay` 里自建了一套：
 
-- **卡片**：`kCardCount = 2`。card 0 = 原生 AI 主屏；card 1 = `BuildHelloPage()`
-  创建的满屏黑底页面（最后创建，层级最高，不透明即可盖住主屏）。
-  新增卡片时把 `kCardCount` 加一并扩展 `BuildHelloPage()`/`ShowCard()`。
+- **卡片**：`kCardCount = 2`。card 0 = 原生 AI 主屏；card 1 = `BuildSensorPage()`
+  创建的满屏黑底页面（四圆温湿度仪表盘，最后创建，层级最高，不透明即可盖住主屏）。
+  新增卡片时把 `kCardCount` 加一并扩展 `BuildSensorPage()`/`ShowCard()`。
 - **手势**：`ShowCard/NextCard/PrevCard` 只切换卡片页的 `LV_OBJ_FLAG_HIDDEN`，
   不隐藏主屏子对象 —— 否则会破坏 `SetEmotion()`/`SetPreviewImage()` 对
   `emoji_box_` 的显隐状态管理。
 - **方向**：横向左滑 → 下一张卡，右滑 → 返回；纵向暂不处理但会打日志。
   阈值 `kSwipeThresholdPx = 60`（约屏宽 15%）。
 
-#### 为什么不用 LVGL 原生 `LV_EVENT_GESTURE`
+#### 为什么挂在 indev 事件上（而不是对象事件）
 
-`lv_indev.c` 的 `indev_gesture()` 在 `scroll_obj != NULL` 时**直接 return**
-（滚动优先），其余情况只发给被按对象、需要 `LV_OBJ_FLAG_GESTURE_BUBBLE`
-才冒泡。本板 UI 大量用 `lv_obj_create()`，**默认就是可滚动的**，原生手势
-会被滚动吃掉。改用手动检测 `LV_EVENT_PRESSED` / `PRESSING` / `RELEASED`，
-这三者总会冒泡到 screen、不受滚动状态影响。
+两套 LVGL 机制都被证伪过，都不可用：
+
+- **原生 `LV_EVENT_GESTURE`**：`indev_gesture()` 在 `scroll_obj != NULL` 时
+  **直接 return**（滚动优先），其余情况只发给被按对象、需要
+  `LV_OBJ_FLAG_GESTURE_BUBBLE` 才冒泡。本板 UI 大量用 `lv_obj_create()`，
+  **默认就是可滚动的**，原生手势会被滚动吃掉。
+- **对象级 `PRESSED/PRESSING/RELEASED`**（第一版实现）：只发给 hit-test 命中的
+  对象（如 `container_`），`event_send_core()` 向上冒泡要求链条上每个对象都带
+  `LV_OBJ_FLAG_EVENT_BUBBLE`（`lv_obj_event.c`），而**全仓库没有任何对象设置过
+  该 flag** → 注册在 screen 上的回调从未被触发（滑动完全无反应，2026-09-29
+  硬件验证证实）。
+- **现方案**：`lv_indev_add_event_cb()` 挂在触摸 indev 自身的事件列表上。
+  `send_event()`（`lv_indev.c`）把 `PRESSED`/`RELEASED` **无条件、先于对象分发**
+  转发到 indev 列表，与命中对象、滚动状态均无关。`PRESSING` 不在转发名单内，
+  因此手势位移按**按下点 → 抬手点**的差值计算（驱动在 release 时保留
+  `s_last_x/y` 为最后接触点）。
+
 

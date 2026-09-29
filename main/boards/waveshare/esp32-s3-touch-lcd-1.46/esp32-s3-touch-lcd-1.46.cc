@@ -83,7 +83,9 @@ public:
 
         lv_obj_t* screen = lv_screen_active();
         BuildSensorPage(screen);
-        RegisterSwipeDetection(screen);
+        // Swipe detection is NOT registered here: it now hangs off the touch
+        // indev (see RegisterSwipeDetection) and is wired up by the board
+        // right after the touch driver registers that indev.
     }
 
     // Hook for the four sensor readouts. Today the values come from the mock
@@ -95,6 +97,25 @@ public:
         DisplayLockGuard lock(this);
         sensor_readings_[index] = {temperature_c, humidity_percent};
         RefreshSensorLabels(index);
+    }
+
+    // Swipe detection on the indev's OWN event list (lv_indev_add_event_cb).
+    // Object-level events cannot be used here: LVGL dispatches PRESSED and
+    // RELEASED only to the hit-tested object, and event_send_core() propagates
+    // them to parents only while every object in the chain carries
+    // LV_OBJ_FLAG_EVENT_BUBBLE (lv_obj_event.c) - nothing in this codebase sets
+    // that flag, so a screen-level callback never fires (that was the original
+    // no-op bug). The indev list instead receives PRESSED/RELEASED
+    // unconditionally in send_event() BEFORE the object dispatch (lv_indev.c),
+    // regardless of the hit target or scroll state. PRESSING is not forwarded
+    // to the indev list, so the gesture is measured press point -> release
+    // point instead of tracking intermediate moves. Safe to call before
+    // SetupUI(): indev events do not depend on the widget tree.
+    void RegisterSwipeDetection(lv_indev_t* indev) {
+        DisplayLockGuard lock(this);
+        touch_indev_ = indev;
+        lv_indev_add_event_cb(indev, SwipeEventCb, LV_EVENT_PRESSED, this);
+        lv_indev_add_event_cb(indev, SwipeEventCb, LV_EVENT_RELEASED, this);
     }
 
 private:
@@ -115,7 +136,9 @@ private:
         lv_obj_set_style_border_width(sensor_page_, 0, 0);
         lv_obj_set_style_radius(sensor_page_, 0, 0);
         lv_obj_set_scrollbar_mode(sensor_page_, LV_SCROLLBAR_MODE_OFF);
-        // Swiping must reach the screen handler instead of scrolling this page.
+        // Swipe detection lives on the touch indev's event list, so scrolling
+        // state is irrelevant here; still keep the page non-scrollable so a
+        // horizontal drag cannot rubber-band it.
         lv_obj_remove_flag(sensor_page_, LV_OBJ_FLAG_SCROLLABLE);
         lv_obj_add_flag(sensor_page_, LV_OBJ_FLAG_HIDDEN);
 
@@ -184,51 +207,35 @@ private:
         }
     }
 
-    // Swipe detection. LVGL's own LV_EVENT_GESTURE is deliberately not used here:
-    // indev_gesture() bails out whenever the pressed object is scrollable
-    // (scroll_obj != NULL) and otherwise only fires on the pressed object unless
-    // LV_OBJ_FLAG_GESTURE_BUBBLE is set. Most of this UI is built with
-    // lv_obj_create(), which is scrollable by default, so the native gesture
-    // would be swallowed. PRESSED/PRESSING/RELEASED bubble to the screen
-    // regardless, which makes this far more predictable.
-    void RegisterSwipeDetection(lv_obj_t* screen) {
-        lv_obj_add_event_cb(screen, SwipeEventCb, LV_EVENT_PRESSED, this);
-        lv_obj_add_event_cb(screen, SwipeEventCb, LV_EVENT_PRESSING, this);
-        lv_obj_add_event_cb(screen, SwipeEventCb, LV_EVENT_RELEASED, this);
-    }
-
+    // Fires for PRESSED and RELEASED on the touch indev's event list. The
+    // point read at PRESSED is the swipe start; at RELEASED the driver has
+    // already latched the final contact position (s_last_x/y survive the
+    // release read), so end - start is the full gesture delta.
     static void SwipeEventCb(lv_event_t* e) {
         auto* self = static_cast<CustomLcdDisplay*>(lv_event_get_user_data(e));
-
-        lv_indev_t* indev = lv_indev_active();
-        if (indev == nullptr || lv_indev_get_type(indev) != LV_INDEV_TYPE_POINTER) {
+        if (self->touch_indev_ == nullptr) {
             return;
         }
 
         lv_point_t p;
-        lv_indev_get_point(indev, &p);
+        lv_indev_get_point(self->touch_indev_, &p);
 
-        const lv_event_code_t code = lv_event_get_code(e);
-        if (code == LV_EVENT_PRESSED) {
+        if (lv_event_get_code(e) == LV_EVENT_PRESSED) {
             self->swipe_start_ = p;
-            self->swipe_last_ = p;
             self->swiping_ = true;
-        } else if (code == LV_EVENT_PRESSING) {
-            if (self->swiping_) {
-                self->swipe_last_ = p;
-            }
         } else {  // LV_EVENT_RELEASED
             if (!self->swiping_) {
                 return;
             }
             self->swiping_ = false;
-            const int dx = self->swipe_last_.x - self->swipe_start_.x;
-            const int dy = self->swipe_last_.y - self->swipe_start_.y;
-            self->HandleSwipe(dx, dy);
+            self->HandleSwipe(p.x - self->swipe_start_.x, p.y - self->swipe_start_.y);
         }
     }
 
     void HandleSwipe(int dx, int dy) {
+        // Logged unconditionally while the gesture threshold is still being
+        // tuned on hardware, so even sub-threshold moves are visible.
+        ESP_LOGI(TAG, "touch release dx=%d dy=%d card=%d", dx, dy, card_index_);
         if (LV_ABS(dx) >= LV_ABS(dy)) {
             if (LV_ABS(dx) < kSwipeThresholdPx) {
                 return;
@@ -249,10 +256,13 @@ private:
         if (index < 0 || index >= kCardCount || index == card_index_) {
             return;
         }
-        card_index_ = index;
+        // Registered in the board constructor, swipe events can arrive before
+        // SetupUI() built the page; ignore them instead of advancing
+        // card_index_ with no page to show.
         if (sensor_page_ == nullptr) {
             return;
         }
+        card_index_ = index;
         if (card_index_ == 0) {
             lv_obj_add_flag(sensor_page_, LV_OBJ_FLAG_HIDDEN);
         } else {
@@ -269,17 +279,19 @@ private:
     lv_obj_t* sensor_humidity_labels_[kSensorCount] = {};
     lv_obj_t* sensor_page_ = nullptr;
     lv_timer_t* sensor_mock_timer_ = nullptr;
+    lv_indev_t* touch_indev_ = nullptr;
     int card_index_ = 0;
     bool swiping_ = false;
     lv_point_t swipe_start_ = {0, 0};
-    lv_point_t swipe_last_ = {0, 0};
 };
 
 class CustomBoard : public WifiBoard {
 private:
     i2c_master_bus_handle_t i2c_bus_;
     esp_io_expander_handle_t io_expander = NULL;
-    LcdDisplay* display_;
+    // Concrete type (not LcdDisplay*) because InitializeTouch() hands the
+    // touch indev to the board-specific RegisterSwipeDetection().
+    CustomLcdDisplay* display_;
     button_handle_t boot_btn, pwr_btn;
     button_driver_t* boot_btn_driver_ = nullptr;
     button_driver_t* pwr_btn_driver_ = nullptr;
@@ -392,9 +404,15 @@ private:
             ESP_LOGE(TAG, "SPD2010 touch controller not responding");
             return;
         }
-        if (!spd2010_touch::Register()) {
+        lv_indev_t* touch_indev = spd2010_touch::Register();
+        if (touch_indev == nullptr) {
             ESP_LOGE(TAG, "failed to register LVGL touch input device");
+            return;
         }
+        // Runs before Application::Initialize() calls SetupUI(); swipe events
+        // arrive on the indev list and do not touch any widget, so ordering
+        // against the UI build does not matter.
+        display_->RegisterSwipeDetection(touch_indev);
     }
 
     void InitializeButtonsCustom() {
