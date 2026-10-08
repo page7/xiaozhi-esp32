@@ -249,3 +249,19 @@ Log:
 - 设置图标: `font_material_symbols_30_4`（lcd_display.cc 已链接）+ `MATERIAL_SYMBOLS_SETTINGS`，`BOTTOM_MID y-8`（y≈374..404，圆屏该处半宽 ≥57px，30px 图标可见），仅在 card1 页面上
 - 坑: 本 LVGL 版本透明度枚举是 `LV_OPA_TRANSP` 不是 `LV_OPA_TRANSPARENT`（首次编译报错已修）；clang-format 本机不在 PATH，pip 装的 clang-format 23.1.1（`E:\pyenv\...\Scripts`）
 - 验证: 编译+clang-format+烧录 COM7+75s 监视：`sensor grid: diameter=150` 正常、`Refreshing display theme`（上次崩溃点）通过、MQTT 连接、无 crash/backtrace；待目视确认四圆 40px 加粗湿度、三档环色、序号 1-4、底部齿轮图标
+
+### [2026-10-08] 第二屏设置功能：XL0801 蓝牙绑定 + 去模拟数据
+- 状态: 已完成（编译+clang-format+主机测试+烧录硬件验证通过；四圆读数/重启恢复/环色待肉眼确认）
+- 范围: main/boards/waveshare/esp32-s3-touch-lcd-1.46/{ble_sensor.h,ble_sensor.cc,esp32-s3-touch-lcd-1.46.cc,config.json,README.md}、AGENTS.md
+- 需求: 去掉第二屏模拟数据；默认未绑定时温度显示"未绑定"、湿度留空；齿轮打开设置页自动搜索名称 XL0801 的蓝牙设备，显示 MAC 和绑定按钮；点绑定选 1-4 号位，绑定后返回第二屏按广播数据显示
+- 方案: 新增 `ble_sensor.h/.cc`（NimBLE observer：`nimble_port_init`+`ble_gap_disc(BLE_HS_FOREVER)`，filter_duplicates=0 以持续刷新；AD 解析按名称 0x09/0x08 == XL0801 + 厂商数据 0xFF 尾部锚定 `[温度 u16 大端/10][湿度 u8][MAC 6B]`，前缀 `01 09` 忽略；绑定存 NVS ns `ble_sensor` key `slot1..4`）；板级 `CustomLcdDisplay` 增加 `settings_page_`（黑底覆盖层：标题/搜索状态/设备列表行=名称+montserrat_12 MAC+绑定按钮/返回）与 `slot_panel_`（1-4 数字按钮+空/已绑状态），`ApplyBinding` 写 NVS、同 MAC 自动清其它位、关设置页回第二屏；`RefreshSensorLabels` 三态（未绑定→"未绑定"+空+灰环，绑定无数据→`--`，有数据→数值+分档环色）；mock timer/初值/`SetSensorReading` 全部删除；扫描生命周期 = 设置页打开或有绑定才扫，否则 `StopScanning`；`config.json` sdkconfig_append 加 `CONFIG_BT_ENABLED=y`、`CONFIG_BT_NIMBLE_ENABLED=y`（NimBLE host 常驻不销毁）；设置页打开期间 `HandleSwipe` 早退吞手势
+- 关键点: 例子 `0201040709584C303830310CFF0109012045ED680104918C` 解析得 28.8°C/69%/ED:68:01:04:91:8C（用户所述 0110=27.2、3E=62 为同布局另一包，位置"往前2位湿度/再往前4位温度"与样本 `45`/`0120` 完全对应）；IDF 6.1 `ble_gap_disc` 是 5 参（own_addr_type 在前）、`BLE_HS_FOREVER=INT32_MAX`、own_addr_type 常量是 `BLE_OWN_ADDR_PUBLIC`（无 `BLE_ADDR_TYPE_*`）；回调跑 NimBLE host task，动控件前取 `DisplayLockGuard`，绑定用内存缓存不碰 NVS；中文 label 一律继承 screen 字体不显式设（防主题换字体悬空，同 2026-09-28 崩溃教训）
+- 齿轮热区修复: 首轮烧录后硬件上 30+ 次点击稳定落在 y=406-408（原 label 命中框 372..404，差 2-4px）全部 miss、无 `settings opened`；改为 `pad_hor 16 + pad_bottom 12` 后 `BOTTOM_MID y=+4`——文字视觉位置不变、命中框扩到 372..416 × 175..237，点击立即生效
+- 验证: `python scripts/build.py waveshare/esp32-s3-touch-lcd-1.46 --name esp32-s3-touch-lcd-1.46` 通过（xiaozhi.bin 0x2db3a0，app 分区余 27%，sdkconfig 确认 BT_ENABLED/NIMBLE/CONTROLLER/OBSERVER 全 y）；clang-format --dry-run 通过；主机测试 scripts/tests 6 个报错经 stash 对比确认为改动前就存在的环境问题（tempfile 目录锁/缺工具链）；COM7 烧录+两次监视确认：`settings opened` → NimBLE `scan started` → `found ED:68:01:03:B5:AC: 28.5C 36%` → `device row added` → `binding picker` → `slot 1 bound` → `settings closed` 全链路通过、重复绑定正常、设置页打开期间手势被吞、无 crash、free sram 稳定 ~48KB（扫描常驻后，minimal 33KB）；待肉眼确认：四圆 1 号显示 28.5°C/36%、2-4 号"未绑定"+空湿度、设置页布局与三档环色
+
+### [2026-10-08] 设置页二轮调整：返回热区 + 行首改实时读数
+- 状态: 已完成（编译+clang-format+烧录通过，开机绑定恢复自动扫描已日志确认；返回/读数显示待实测）
+- 范围: main/boards/waveshare/esp32-s3-touch-lcd-1.46/{esp32-s3-touch-lcd-1.46.cc,README.md}、AGENTS.md
+- 需求: 1) 返回按钮关不掉设置页；2) 列表里所有设备都叫 XL0801，换成广播温湿度以区分
+- 方案: 1) 返回按钮 96x40/-14（358..398）→ `120x56` + `BOTTOM_MID y=+4`（360..416 × 146..266，与齿轮同款圆屏边缘落点问题）；另加兜底：设置页打开时横向右滑 ≥60px 关闭（左/竖滑仍吞）。2) `FoundDevice` 增 `reading_label`，行首 "XL0801" 换成 `%.1f°C %.0f%%` 实时读数；`UpdateDeviceReading()` 每包 strcmp 节流后才 `lv_label_set_text`；行仅设置页打开时创建、关闭后仍静默刷新
+- 验证: 编译（xiaozhi.bin 0x2db4d0，分区余 27%）+clang-format 通过；COM7 烧录+5min 监视：开机即恢复扫描（slot1 绑定存在 → 1.3s `scan started` → 4s `found ED:68:01:03:B5:AC: 28.5C 36%`）、无 crash、free sram 稳定 48KB；该轮无触摸操作，返回按钮/行读数需实测

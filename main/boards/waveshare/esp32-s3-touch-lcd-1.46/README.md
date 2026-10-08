@@ -59,11 +59,16 @@ https://www.waveshare.net/shop/ESP32-S3-Touch-LCD-1.46B.htm
   （位图字体无效，本工程也未开 FREETYPE），必须放进**固定尺寸** 130×48 容器：
   `LV_SIZE_CONTENT` 只量得到 align x/y 偏移为 0 的副本，会把 +1px 的三层裁掉。
   圆框按湿度分档：`>20%` 橙 `#FFBB00`、`>30%` 红 `#ff4000`（优先）、否则灰
-  `#555555`，判档在 `RefreshSensorLabels()`；mock 湿度 15~35、初值 {16,24,33,26}
-  以同时展示三档。每圆底部序号 1-4：`LV_OBJ_FLAG_FLOATING` 让 flex 跳过该子对象
+  `#555555`，判档在 `RefreshSensorLabels()`；**无读数（未绑定/绑定未收到广播）恒灰**。
+  每圆底部序号 1-4：`LV_OBJ_FLAG_FLOATING` 让 flex 跳过该子对象
   （`lv_obj_is_layout_positioned` 返回 false），`lv_obj_refr_pos()` 仍按
   `BOTTOM_MID` 摆位；页面底部中间设置图标 = `font_material_symbols_30_4` +
-  `MATERIAL_SYMBOLS_SETTINGS`（与主屏 emoji 共用同一已链接字体）。
+  `MATERIAL_SYMBOLS_SETTINGS`（与主屏 emoji 共用同一已链接字体），已加
+  `LV_OBJ_FLAG_CLICKABLE` + `LV_EVENT_CLICKED` 打开设置页。
+  **热区**：`pad_hor 16 + pad_bottom 12` 再 `BOTTOM_MID y=+4`——文字视觉位置
+  不变（372..404），命中框扩到 372..416 × 175..237；首轮硬件测试里手指稳定
+  落在 y=406-408（比原命中框低 2-4px）导致 30+ 次点击全部 miss（无 CLICKED 日志），
+  扩大热区后点击正常。
 - **状态栏（整条隐藏，顶部留白）**：主屏(card0) 原本有 `top_bar_`（网络/静音/
   电池图标）+ `status_bar_`（居中时钟、状态文字、通知），板级 `SetupUI()` 对二者
   `lv_obj_add_flag(..., HIDDEN)` 后**顶部完全无内容**。时钟/状态/通知的更新链路
@@ -71,6 +76,44 @@ https://www.waveshare.net/shop/ESP32-S3-Touch-LCD-1.46B.htm
   隐藏对象。`low_battery_popup_` 是 screen 的独立子对象（lcd_display.cc），不在
   `status_bar_` 内，低电量弹窗仍可弹出；Alert 仍通过 `SetEmotion`+`SetChatMessage`
   （表情+聊天气泡）可见。第二屏(card1) 的 `sensor_page_` 本就全屏不透明盖住二者。
+
+#### 第二屏设置页与 XL0801 蓝牙绑定
+
+- **状态显示**：模拟数据已移除。未绑定 → 温度位显示"未绑定"、湿度留空、圆环灰；
+  绑定但未收到广播 → 温度位 `--`；收到广播 → `%.1f°C` / `%.0f%%`。
+- **设置页**（齿轮 → `OpenSettings()`）：满屏黑底覆盖层（`settings_page_`，
+  在 `sensor_page_` 之后创建所以层级在上），打开即自动扫描（标题/状态/
+  居中设备列表/底部"返回"）。列表按**去重 MAC** 追加命中的 XL0801 行：
+  **行首是实时广播读数 `28.5°C 36%`**（所有传感器都叫 XL0801，读数才是区分
+  依据；`UpdateDeviceReading()` 逐包刷新，strcmp 只在文本变化时才
+  `lv_label_set_text`，避免广播频率下的重复分配）+ montserrat_12 的 MAC +
+  "绑定"按钮；空列表提示"未找到 XL0801 设备"（首个设备出现时删除）。
+  行仅在设置页打开期间创建，但已存在行在关闭后仍随广播静默刷新。
+- **返回**：按钮 `120x56`、`BOTTOM_MID y=+4`（命中框 360..416 × 146..266）——
+  与齿轮同样的问题：圆屏边缘手指落点稳定在 y=406-408，原 96x40/-14 按钮
+  （358..398）全部 miss；另外设置页打开时**横向右滑 ≥60px 也关闭**
+  （`HandleSwipe` 里 `settings_open_` 分支），左滑/竖滑仍被吞。
+- **绑定流程**："绑定" → 居中 `slot_panel_` 选 1-4 号位（按钮下"空/已绑"状态，
+  `lv_font_montserrat_40` 数字）→ `ApplyBinding()` 写 NVS 并关闭设置页回第二屏。
+  同一 MAC 只允许占一个圆（占新位时自动从其它位清除）。暂无解绑入口。
+- **扫描生命周期**（`RefreshScanState()`）：设置页打开 **或** 任一位已绑定 →
+  `ble_sensor::EnsureScanning()`；两者皆无 → `StopScanning()`（NimBLE host
+  常驻不销毁）。绑定后开机会自动恢复扫描并直接出数。
+- **广播解析**（`ble_sensor.cc`，尾部锚定，前缀字节忽略）：
+  厂商数据 `0xFF` 尾部 = `[温度 u16 大端, 0.1°C][湿度 u8, %][MAC 6B]`，
+  例如 `...01 20 45 ED 68 01 04 91 8C` → 28.8°C / 69% / `ED:68:01:04:91:8C`
+  （用户给的 0110/3E 分别 = 27.2°C/62% 是同布局的另一包）。
+  名称必须为 `XL0801`（AD type 0x09/0x08），厂商数据至少 9 字节。
+- **线程模型**：扫描回调跑在 NimBLE host task → `CustomLcdDisplay::OnBleAdvertisement()`
+  先取 `DisplayLockGuard` 再动控件；绑定缓存在 `bindings_[]`（NVS 只在
+  SetupUI/写入时访问），回调路径不碰 NVS。
+- **sdkconfig**：`config.json` 的 `sdkconfig_append` 增加
+  `CONFIG_BT_ENABLED=y`、`CONFIG_BT_NIMBLE_ENABLED=y`（`BT_NIMBLE_ROLE_OBSERVER`
+  默认即 y）；本仓库 `main` 组件本就 `PRIV_REQUIRES bt`，BluFi 未启用，无冲突。
+  NimBLE host + controller 只在 `EnsureScanning()` 首次调用时才
+  `nimble_port_init()`（即首次进设置页或已有绑定的开机）。
+- **设置页打开期间**：左滑/竖滑被吞掉（防止误切卡片），**右滑 ≥60px 关闭设置页**，
+  关闭主要仍靠底部"返回"按钮。
 
 #### 为什么挂在 indev 事件上（而不是对象事件）
 

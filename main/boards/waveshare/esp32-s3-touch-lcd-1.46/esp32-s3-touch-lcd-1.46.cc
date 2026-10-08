@@ -12,13 +12,15 @@
 #include <esp_lcd_panel_ops.h>
 #include <esp_lcd_spd2010.h>
 #include <esp_log.h>
-#include <esp_random.h>
 #include <esp_timer.h>
 #include <iot_button.h>
 #include <material_symbols.h>
-#include <algorithm>
+#include <array>
 #include <cstdio>
 #include <cstring>
+#include <string>
+#include <vector>
+#include "ble_sensor.h"
 #include "esp_io_expander_tca9554.h"
 #include "i2c_device.h"
 #include "lcd_display.h"
@@ -63,6 +65,11 @@ constexpr float kHumidityRed = 30.0f;
 // is already linked through lcd_display.cc; the Montserrat sizes come from
 // config.json sdkconfig_append (CONFIG_LV_FONT_MONTSERRAT_40/12=y).
 LV_FONT_DECLARE(font_material_symbols_30_4);
+
+// Settings page (gear overlay): list of discovered XL0801 devices plus the
+// slot picker. The panel is round, so the list is a centred column that
+// stays inside the widest band of the 412x412 framebuffer.
+constexpr int kSettingsListWidth = 280;
 
 // 在waveshare_lcd_1_46类之前添加新的显示类
 class CustomLcdDisplay : public SpiLcdDisplay {
@@ -115,20 +122,25 @@ public:
 
         lv_obj_t* screen = lv_screen_active();
         BuildSensorPage(screen);
+        BuildSettingsPage(screen);
         // Swipe detection is NOT registered here: it now hangs off the touch
         // indev (see RegisterSwipeDetection) and is wired up by the board
         // right after the touch driver registers that indev.
-    }
 
-    // Hook for the four sensor readouts. Today the values come from the mock
-    // timer below; later the BLE stack can call this from any task.
-    void SetSensorReading(int index, float temperature_c, float humidity_percent) {
-        if (index < 0 || index >= kSensorCount) {
-            return;
+        // Advertisement updates arrive on the NimBLE host task; the callback
+        // takes the LVGL lock itself before touching any widget.
+        ble_sensor::SetCallback([this](const std::string& mac, const ble_sensor::Reading& reading) {
+            OnBleAdvertisement(mac, reading);
+        });
+        // Restore bindings; bound circles start out waiting for their first
+        // advertisement. Keep scanning while anything is bound so readings
+        // show up right after boot.
+        for (int i = 0; i < kSensorCount; ++i) {
+            bindings_[i] = ble_sensor::GetBinding(i);
+            sensor_readings_[i].bound = !bindings_[i].empty();
+            RefreshSensorLabels(i);
         }
-        DisplayLockGuard lock(this);
-        sensor_readings_[index] = {temperature_c, humidity_percent};
-        RefreshSensorLabels(index);
+        RefreshScanState();
     }
 
     // Swipe detection on the indev's OWN event list (lv_indev_add_event_cb).
@@ -152,8 +164,16 @@ public:
 
 private:
     struct SensorReading {
-        float temperature_c;
-        float humidity_percent;
+        bool bound = false;     // slot has a MAC assigned
+        bool has_data = false;  // an advertisement has been parsed for it
+        float temperature_c = 0.0f;
+        float humidity_percent = 0.0f;
+    };
+
+    struct FoundDevice {
+        std::string mac;
+        lv_obj_t* bind_btn = nullptr;
+        lv_obj_t* reading_label = nullptr;  // live "28.5C 36%" header
     };
 
     // Card 1: the four-circle sensor dashboard. Created last, which puts it
@@ -256,58 +276,421 @@ private:
         // Settings gear at the bottom centre of the page. On the round panel
         // y~400 still leaves ~57px of visible half-width, enough for the
         // ~30px icon; sits 12px below the bottom circles (grid ends at 362).
+        // Hit area: first widen/extend with padding (pad_bottom pushes the
+        // border box past the text without moving it), then align - hardware
+        // taps repeatedly landed at y=406-408, a few px below the plain
+        // 372..404 text box, and silently missed (no LV_EVENT_CLICKED).
         lv_obj_t* settings_icon = lv_label_create(sensor_page_);
         lv_obj_set_style_text_font(settings_icon, &font_material_symbols_30_4, 0);
         lv_obj_set_style_text_color(settings_icon, lv_color_hex(0xAAAAAA), 0);
         lv_label_set_text(settings_icon, MATERIAL_SYMBOLS_SETTINGS);
-        lv_obj_align(settings_icon, LV_ALIGN_BOTTOM_MID, 0, -8);
+        lv_obj_set_style_pad_hor(settings_icon, 16, 0);
+        lv_obj_set_style_pad_bottom(settings_icon, 12, 0);
+        lv_obj_align(settings_icon, LV_ALIGN_BOTTOM_MID, 0, 4);
+        lv_obj_add_flag(settings_icon, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_add_event_cb(settings_icon, SettingsIconCb, LV_EVENT_CLICKED, this);
 
         for (int i = 0; i < kSensorCount; ++i) {
             RefreshSensorLabels(i);
         }
-
-        // Mock data until the BLE sensors are wired up.
-        sensor_mock_timer_ = lv_timer_create(MockSensorTimerCb, 3000, this);
     }
 
     void RefreshSensorLabels(int index) {
+        const SensorReading& reading = sensor_readings_[index];
         char buf[16];
-        snprintf(buf, sizeof(buf), "%.1f°C", sensor_readings_[index].temperature_c);
-        lv_label_set_text(sensor_temp_labels_[index], buf);
-        snprintf(buf, sizeof(buf), "%.0f%%", sensor_readings_[index].humidity_percent);
+        if (!reading.bound) {
+            // Unbound: temperature says so, humidity stays empty.
+            lv_label_set_text(sensor_temp_labels_[index], "未绑定");
+            buf[0] = '\0';
+        } else if (!reading.has_data) {
+            // Bound but no advertisement parsed yet.
+            lv_label_set_text(sensor_temp_labels_[index], "--");
+            buf[0] = '\0';
+        } else {
+            snprintf(buf, sizeof(buf), "%.1f°C", reading.temperature_c);
+            lv_label_set_text(sensor_temp_labels_[index], buf);
+            snprintf(buf, sizeof(buf), "%.0f%%", reading.humidity_percent);
+        }
         for (int k = 0; k < kHumBoldLayers; ++k) {
             lv_label_set_text(sensor_humidity_labels_[index][k], buf);
         }
         // Ring colour follows humidity: red above 30%, orange above 20%,
-        // grey otherwise (red checked last so it wins over orange).
-        // lv_style_set_prop() updates the local prop in place, so calling
-        // this every refresh does not grow the style list.
-        const float humidity = sensor_readings_[index].humidity_percent;
+        // grey otherwise (red checked last so it wins over orange); grey
+        // whenever there is no reading yet. lv_style_set_prop() updates the
+        // local prop in place, so calling this every refresh does not grow
+        // the style list.
         lv_color_t ring = lv_color_hex(0x555555);
-        if (humidity > kHumidityOrange) {
-            ring = lv_color_hex(0xFFBB00);
-        }
-        if (humidity > kHumidityRed) {
-            ring = lv_color_hex(0xff4000);
+        if (reading.has_data) {
+            if (reading.humidity_percent > kHumidityOrange) {
+                ring = lv_color_hex(0xFFBB00);
+            }
+            if (reading.humidity_percent > kHumidityRed) {
+                ring = lv_color_hex(0xff4000);
+            }
         }
         lv_obj_set_style_border_color(sensor_circles_[index], ring, 0);
     }
 
-    static void MockSensorTimerCb(lv_timer_t* timer) {
-        auto* self = static_cast<CustomLcdDisplay*>(lv_timer_get_user_data(timer));
-        for (int i = 0; i < kSensorCount; ++i) {
-            const float temperature =
-                std::clamp(self->sensor_readings_[i].temperature_c +
-                               (static_cast<int>(esp_random() % 5) - 2) * 0.1f,
-                           20.0f, 30.0f);
-            // Mock humidity spans the three ring tiers (<=20 grey,
-            // 20-30 orange, >30 red) so all colours are visible until the
-            // real BLE readings arrive.
-            const float humidity = std::clamp(self->sensor_readings_[i].humidity_percent +
-                                                  (static_cast<int>(esp_random() % 5) - 2) * 0.5f,
-                                              15.0f, 35.0f);
-            self->SetSensorReading(i, temperature, humidity);
+    // NimBLE host-task entry point: refresh bound circles and (while the
+    // settings page is open) grow the discovered-device list.
+    void OnBleAdvertisement(const std::string& mac, const ble_sensor::Reading& reading) {
+        DisplayLockGuard lock(this);
+        // Every XL0801 looks alike in the scan list, so the row header is the
+        // live broadcast reading (not the model name) - that is how the user
+        // tells devices apart. Rows are only created while the settings page
+        // is open, but existing rows keep refreshing even while hidden.
+        FoundDevice* device = FindFoundDevice(mac);
+        if (device != nullptr) {
+            UpdateDeviceReading(device, reading);
+        } else if (settings_open_) {
+            AddFoundDeviceRow(mac, reading);
         }
+        for (int i = 0; i < kSensorCount; ++i) {
+            if (bindings_[i].empty() || bindings_[i] != mac) {
+                continue;
+            }
+            sensor_readings_[i] = {true, true, reading.temperature_c, reading.humidity_percent};
+            RefreshSensorLabels(i);
+        }
+    }
+
+    // Scanning is needed while the settings list is open (to discover
+    // devices) or while any slot is bound (to keep readings live); otherwise
+    // park the radio.
+    void RefreshScanState() {
+        bool any_bound = false;
+        for (const auto& binding : bindings_) {
+            if (!binding.empty()) {
+                any_bound = true;
+                break;
+            }
+        }
+        if (settings_open_ || any_bound) {
+            ble_sensor::EnsureScanning();
+        } else {
+            ble_sensor::StopScanning();
+        }
+    }
+
+    static void SettingsIconCb(lv_event_t* e) {
+        auto* self = static_cast<CustomLcdDisplay*>(lv_event_get_user_data(e));
+        self->OpenSettings();
+    }
+
+    static void BackButtonCb(lv_event_t* e) {
+        auto* self = static_cast<CustomLcdDisplay*>(lv_event_get_user_data(e));
+        self->CloseSettings();
+    }
+
+    static void BindButtonCb(lv_event_t* e) {
+        auto* self = static_cast<CustomLcdDisplay*>(lv_event_get_user_data(e));
+        lv_obj_t* btn = static_cast<lv_obj_t*>(lv_event_get_target(e));
+        for (const auto& device : self->found_devices_) {
+            if (device.bind_btn == btn) {
+                self->OpenSlotPicker(device.mac);
+                return;
+            }
+        }
+    }
+
+    static void SlotButtonCb(lv_event_t* e) {
+        auto* self = static_cast<CustomLcdDisplay*>(lv_event_get_user_data(e));
+        lv_obj_t* btn = static_cast<lv_obj_t*>(lv_event_get_target(e));
+        for (int i = 0; i < kSensorCount; ++i) {
+            if (self->slot_buttons_[i] == btn) {
+                self->ApplyBinding(i, self->pending_mac_);
+                return;
+            }
+        }
+    }
+
+    void OpenSettings() {
+        if (settings_open_ || settings_page_ == nullptr) {
+            return;
+        }
+        ESP_LOGI(TAG, "settings opened");
+        settings_open_ = true;
+        lv_obj_add_flag(slot_panel_, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_remove_flag(settings_page_, LV_OBJ_FLAG_HIDDEN);
+        RefreshScanState();
+    }
+
+    void CloseSettings() {
+        if (!settings_open_) {
+            return;
+        }
+        ESP_LOGI(TAG, "settings closed");
+        settings_open_ = false;
+        lv_obj_add_flag(slot_panel_, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_add_flag(settings_page_, LV_OBJ_FLAG_HIDDEN);
+        RefreshScanState();
+    }
+
+    void OpenSlotPicker(const std::string& mac) {
+        pending_mac_ = mac;
+        for (int i = 0; i < kSensorCount; ++i) {
+            const bool bound = !bindings_[i].empty();
+            lv_label_set_text(slot_state_labels_[i], bound ? "已绑" : "空");
+            lv_obj_set_style_text_color(slot_state_labels_[i],
+                                        bound ? lv_color_hex(0xFFBB00) : lv_color_hex(0x888888), 0);
+        }
+        lv_obj_remove_flag(slot_panel_, LV_OBJ_FLAG_HIDDEN);
+        ESP_LOGI(TAG, "binding picker for %s", mac.c_str());
+    }
+
+    // Assign `mac` to `slot`: one physical sensor occupies exactly one
+    // circle, so the same MAC is cleared from any other slot. Then return to
+    // the dashboard and keep scanning for readings.
+    void ApplyBinding(int slot, const std::string& mac) {
+        if (mac.empty() || slot < 0 || slot >= kSensorCount) {
+            return;
+        }
+        for (int i = 0; i < kSensorCount; ++i) {
+            if (i == slot || bindings_[i] != mac) {
+                continue;
+            }
+            bindings_[i].clear();
+            ble_sensor::SetBinding(i, "");
+            sensor_readings_[i] = {};
+            RefreshSensorLabels(i);
+        }
+        bindings_[slot] = mac;
+        ble_sensor::SetBinding(slot, mac);
+        sensor_readings_[slot] = {true, false, 0.0f, 0.0f};
+        RefreshSensorLabels(slot);
+        ESP_LOGI(TAG, "bound %s to slot %d", mac.c_str(), slot + 1);
+        CloseSettings();  // also refreshes the scan state with new bindings
+    }
+
+    FoundDevice* FindFoundDevice(const std::string& mac) {
+        for (auto& device : found_devices_) {
+            if (device.mac == mac) {
+                return &device;
+            }
+        }
+        return nullptr;
+    }
+
+    static void FormatReading(char* buf, size_t size, const ble_sensor::Reading& reading) {
+        snprintf(buf, size, "%.1f°C %.0f%%", reading.temperature_c, reading.humidity_percent);
+    }
+
+    // Rewrite the row header only when the formatted text actually changed:
+    // advertisements arrive several times per second and lv_label_set_text()
+    // reallocates the label buffer each call.
+    void UpdateDeviceReading(FoundDevice* device, const ble_sensor::Reading& reading) {
+        if (device->reading_label == nullptr) {
+            return;
+        }
+        char buf[24];
+        FormatReading(buf, sizeof(buf), reading);
+        const char* current = lv_label_get_text(device->reading_label);
+        if (current == nullptr || strcmp(current, buf) != 0) {
+            lv_label_set_text(device->reading_label, buf);
+        }
+    }
+
+    // Card 1 overlay: scan results with a bind button per XL0801 device and
+    // a slot picker (choose circle 1-4). Created after the dashboard, so its
+    // opaque background fully covers it while open.
+    void BuildSettingsPage(lv_obj_t* screen) {
+        settings_page_ = lv_obj_create(screen);
+        lv_obj_set_size(settings_page_, width_, height_);
+        lv_obj_align(settings_page_, LV_ALIGN_CENTER, 0, 0);
+        lv_obj_set_style_bg_color(settings_page_, lv_color_hex(0x000000), 0);
+        lv_obj_set_style_bg_opa(settings_page_, LV_OPA_COVER, 0);
+        lv_obj_set_style_border_width(settings_page_, 0, 0);
+        lv_obj_set_style_radius(settings_page_, 0, 0);
+        lv_obj_set_style_pad_all(settings_page_, 0, 0);
+        lv_obj_set_scrollbar_mode(settings_page_, LV_SCROLLBAR_MODE_OFF);
+        lv_obj_remove_flag(settings_page_, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_add_flag(settings_page_, LV_OBJ_FLAG_HIDDEN);
+
+        // Round panel: keep the header short - at y~44 the visible half-width
+        // is only ~130px. All Chinese text inherits the screen font (the
+        // theme swap swaps the pointer behind it; never capture it here).
+        lv_obj_t* title = lv_label_create(settings_page_);
+        lv_obj_set_style_text_color(title, lv_color_hex(0xFFFFFF), 0);
+        lv_label_set_text(title, "蓝牙设置");
+        lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 34);
+
+        lv_obj_t* status = lv_label_create(settings_page_);
+        lv_obj_set_style_text_color(status, lv_color_hex(0x888888), 0);
+        lv_label_set_text(status, "正在搜索附近设备...");
+        lv_obj_align(status, LV_ALIGN_TOP_MID, 0, 62);
+
+        settings_list_ = lv_obj_create(settings_page_);
+        lv_obj_set_size(settings_list_, kSettingsListWidth, 180);
+        lv_obj_align(settings_list_, LV_ALIGN_CENTER, 0, 0);
+        lv_obj_set_style_bg_opa(settings_list_, LV_OPA_TRANSP, 0);
+        lv_obj_set_style_border_width(settings_list_, 0, 0);
+        lv_obj_set_style_radius(settings_list_, 0, 0);
+        lv_obj_set_style_pad_all(settings_list_, 0, 0);
+        lv_obj_set_style_pad_row(settings_list_, 10, 0);
+        lv_obj_set_scrollbar_mode(settings_list_, LV_SCROLLBAR_MODE_OFF);
+        lv_obj_set_flex_flow(settings_list_, LV_FLEX_FLOW_COLUMN);
+        lv_obj_set_flex_align(settings_list_, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER,
+                              LV_FLEX_ALIGN_CENTER);
+
+        settings_empty_label_ = lv_label_create(settings_list_);
+        lv_obj_set_style_text_color(settings_empty_label_, lv_color_hex(0x666666), 0);
+        lv_label_set_text(settings_empty_label_, "未找到 XL0801 设备");
+        lv_obj_set_style_pad_all(settings_empty_label_, 24, 0);
+
+        // Back to the dashboard (also reachable while the slot picker is
+        // open - the picker only covers the middle band of the round screen).
+        // Hit area: like the gear, taps land on the visible bottom arc
+        // (y=406-408, below the plain 358..398 box) - grow the button down
+        // to the screen edge so the whole lower band closes the page.
+        lv_obj_t* back_btn = lv_button_create(settings_page_);
+        lv_obj_set_size(back_btn, 120, 56);
+        lv_obj_align(back_btn, LV_ALIGN_BOTTOM_MID, 0, 4);
+        lv_obj_set_style_bg_color(back_btn, lv_color_hex(0x333333), 0);
+        lv_obj_t* back_label = lv_label_create(back_btn);
+        lv_label_set_text(back_label, "返回");
+        lv_obj_center(back_label);
+        lv_obj_add_event_cb(back_btn, BackButtonCb, LV_EVENT_CLICKED, this);
+
+        BuildSlotPicker();
+    }
+
+    void BuildSlotPicker() {
+        slot_panel_ = lv_obj_create(settings_page_);
+        lv_obj_set_size(slot_panel_, 300, 230);
+        lv_obj_align(slot_panel_, LV_ALIGN_CENTER, 0, 0);
+        lv_obj_set_style_bg_color(slot_panel_, lv_color_hex(0x111111), 0);
+        lv_obj_set_style_bg_opa(slot_panel_, LV_OPA_COVER, 0);
+        lv_obj_set_style_border_color(slot_panel_, lv_color_hex(0x555555), 0);
+        lv_obj_set_style_border_width(slot_panel_, 1, 0);
+        lv_obj_set_style_radius(slot_panel_, 16, 0);
+        lv_obj_set_style_pad_all(slot_panel_, 16, 0);
+        lv_obj_set_style_pad_row(slot_panel_, 12, 0);
+        lv_obj_set_scrollbar_mode(slot_panel_, LV_SCROLLBAR_MODE_OFF);
+        lv_obj_remove_flag(slot_panel_, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_set_flex_flow(slot_panel_, LV_FLEX_FLOW_COLUMN);
+        lv_obj_set_flex_align(slot_panel_, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER,
+                              LV_FLEX_ALIGN_CENTER);
+        lv_obj_add_flag(slot_panel_, LV_OBJ_FLAG_HIDDEN);
+
+        lv_obj_t* title = lv_label_create(slot_panel_);
+        lv_obj_set_style_text_color(title, lv_color_hex(0xFFFFFF), 0);
+        lv_label_set_text(title, "选择绑定位置");
+
+        lv_obj_t* row = lv_obj_create(slot_panel_);
+        lv_obj_set_size(row, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
+        lv_obj_set_style_bg_opa(row, LV_OPA_TRANSP, 0);
+        lv_obj_set_style_border_width(row, 0, 0);
+        lv_obj_set_style_radius(row, 0, 0);
+        lv_obj_set_style_pad_all(row, 0, 0);
+        lv_obj_set_style_pad_column(row, 8, 0);
+        lv_obj_set_scrollbar_mode(row, LV_SCROLLBAR_MODE_OFF);
+        lv_obj_remove_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
+
+        for (int i = 0; i < kSensorCount; ++i) {
+            lv_obj_t* column = lv_obj_create(row);
+            lv_obj_set_size(column, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
+            lv_obj_set_style_bg_opa(column, LV_OPA_TRANSP, 0);
+            lv_obj_set_style_border_width(column, 0, 0);
+            lv_obj_set_style_radius(column, 0, 0);
+            lv_obj_set_style_pad_all(column, 0, 0);
+            lv_obj_set_style_pad_row(column, 2, 0);
+            lv_obj_set_scrollbar_mode(column, LV_SCROLLBAR_MODE_OFF);
+            lv_obj_remove_flag(column, LV_OBJ_FLAG_SCROLLABLE);
+            lv_obj_set_flex_flow(column, LV_FLEX_FLOW_COLUMN);
+            lv_obj_set_flex_align(column, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER,
+                                  LV_FLEX_ALIGN_CENTER);
+
+            lv_obj_t* btn = lv_button_create(column);
+            lv_obj_set_size(btn, 56, 56);
+            lv_obj_set_style_bg_color(btn, lv_color_hex(0x2B2B2B), 0);
+            lv_obj_set_style_radius(btn, 12, 0);
+            lv_obj_set_style_pad_all(btn, 0, 0);
+            lv_obj_t* digit = lv_label_create(btn);
+            lv_obj_set_style_text_font(digit, &lv_font_montserrat_40, 0);
+            char buf[4];
+            snprintf(buf, sizeof(buf), "%d", i + 1);
+            lv_label_set_text(digit, buf);
+            lv_obj_center(digit);
+            lv_obj_add_event_cb(btn, SlotButtonCb, LV_EVENT_CLICKED, this);
+            slot_buttons_[i] = btn;
+
+            lv_obj_t* state = lv_label_create(column);
+            lv_obj_set_style_text_color(state, lv_color_hex(0x888888), 0);
+            lv_label_set_text(state, "空");
+            slot_state_labels_[i] = state;
+        }
+
+        lv_obj_t* cancel_btn = lv_button_create(slot_panel_);
+        lv_obj_set_size(cancel_btn, 96, 36);
+        lv_obj_set_style_bg_color(cancel_btn, lv_color_hex(0x333333), 0);
+        lv_obj_t* cancel_label = lv_label_create(cancel_btn);
+        lv_label_set_text(cancel_label, "取消");
+        lv_obj_center(cancel_label);
+        lv_obj_add_event_cb(cancel_btn, BackButtonCb, LV_EVENT_CLICKED, this);
+    }
+
+    // One row per unique XL0801; called from the NimBLE host task (holds the
+    // LVGL lock) while the settings page is open. The header shows the live
+    // broadcast reading instead of the model name - all nearby sensors are
+    // called XL0801, the reading is what tells them apart.
+    void AddFoundDeviceRow(const std::string& mac, const ble_sensor::Reading& reading) {
+        if (settings_list_ == nullptr) {
+            return;
+        }
+        if (settings_empty_label_ != nullptr) {
+            lv_obj_delete(settings_empty_label_);
+            settings_empty_label_ = nullptr;
+        }
+
+        lv_obj_t* row = lv_obj_create(settings_list_);
+        lv_obj_set_size(row, kSettingsListWidth - 16, 64);
+        lv_obj_set_style_bg_color(row, lv_color_hex(0x161616), 0);
+        lv_obj_set_style_bg_opa(row, LV_OPA_COVER, 0);
+        lv_obj_set_style_border_width(row, 0, 0);
+        lv_obj_set_style_radius(row, 12, 0);
+        lv_obj_set_style_pad_all(row, 10, 0);
+        lv_obj_set_scrollbar_mode(row, LV_SCROLLBAR_MODE_OFF);
+        lv_obj_remove_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
+        lv_obj_set_flex_align(row, LV_FLEX_ALIGN_SPACE_BETWEEN, LV_FLEX_ALIGN_CENTER,
+                              LV_FLEX_ALIGN_CENTER);
+
+        lv_obj_t* info = lv_obj_create(row);
+        lv_obj_set_size(info, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
+        lv_obj_set_style_bg_opa(info, LV_OPA_TRANSP, 0);
+        lv_obj_set_style_border_width(info, 0, 0);
+        lv_obj_set_style_radius(info, 0, 0);
+        lv_obj_set_style_pad_all(info, 0, 0);
+        lv_obj_set_scrollbar_mode(info, LV_SCROLLBAR_MODE_OFF);
+        lv_obj_remove_flag(info, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_set_flex_flow(info, LV_FLEX_FLOW_COLUMN);
+
+        // Reading header: inherits the screen font (has °C), updated in
+        // place by UpdateDeviceReading() on every parsed advertisement.
+        lv_obj_t* reading_label = lv_label_create(info);
+        lv_obj_set_style_text_color(reading_label, lv_color_hex(0xFFFFFF), 0);
+        char buf[24];
+        FormatReading(buf, sizeof(buf), reading);
+        lv_label_set_text(reading_label, buf);
+
+        // MAC uses the small static font: ASCII only, immune to theme swaps.
+        lv_obj_t* mac_label = lv_label_create(info);
+        lv_obj_set_style_text_font(mac_label, &lv_font_montserrat_12, 0);
+        lv_obj_set_style_text_color(mac_label, lv_color_hex(0xAAAAAA), 0);
+        lv_label_set_text(mac_label, mac.c_str());
+
+        lv_obj_t* bind_btn = lv_button_create(row);
+        lv_obj_set_size(bind_btn, 72, 40);
+        lv_obj_set_style_bg_color(bind_btn, lv_color_hex(0x2F6BFF), 0);
+        lv_obj_t* bind_label = lv_label_create(bind_btn);
+        lv_label_set_text(bind_label, "绑定");
+        lv_obj_center(bind_label);
+        lv_obj_add_event_cb(bind_btn, BindButtonCb, LV_EVENT_CLICKED, this);
+
+        found_devices_.push_back({mac, bind_btn, reading_label});
+        ESP_LOGI(TAG, "device row added: %s %.1fC %.0f%%", mac.c_str(), reading.temperature_c,
+                 reading.humidity_percent);
     }
 
     // Fires for PRESSED and RELEASED on the touch indev's event list. The
@@ -339,6 +722,19 @@ private:
         // Logged unconditionally while the gesture threshold is still being
         // tuned on hardware, so even sub-threshold moves are visible.
         ESP_LOGI(TAG, "touch release dx=%d dy=%d card=%d", dx, dy, card_index_);
+        // The settings overlay owns the screen while open. A deliberate
+        // right swipe closes it (same direction as going "back" on the
+        // dashboard); everything else is swallowed so horizontal drags on
+        // the list cannot flip cards.
+        if (settings_open_) {
+            if (LV_ABS(dx) >= LV_ABS(dy) && dx >= kSwipeThresholdPx) {
+                ESP_LOGI(TAG, "swipe right closes settings");
+                CloseSettings();
+            } else {
+                ESP_LOGI(TAG, "swipe ignored (settings open)");
+            }
+            return;
+        }
         if (LV_ABS(dx) >= LV_ABS(dy)) {
             if (LV_ABS(dx) < kSwipeThresholdPx) {
                 return;
@@ -362,7 +758,7 @@ private:
         // Registered in the board constructor, swipe events can arrive before
         // SetupUI() built the page; ignore them instead of advancing
         // card_index_ with no page to show.
-        if (sensor_page_ == nullptr) {
+        if (sensor_page_ == nullptr || settings_open_) {
             return;
         }
         card_index_ = index;
@@ -376,14 +772,25 @@ private:
     void NextCard() { ShowCard(card_index_ + 1); }
     void PrevCard() { ShowCard(card_index_ - 1); }
 
-    SensorReading sensor_readings_[kSensorCount] = {
-        {25.3f, 16.0f}, {24.8f, 24.0f}, {26.1f, 33.0f}, {23.9f, 26.0f}};
+    SensorReading sensor_readings_[kSensorCount];
+    // Cached NVS bindings ("" = unbound), loaded in SetupUI and kept in
+    // sync by ApplyBinding(); the NimBLE task reads them without touching
+    // NVS.
+    std::array<std::string, kSensorCount> bindings_;
+    std::vector<FoundDevice> found_devices_;
+    std::string pending_mac_;
+    bool settings_open_ = false;
     lv_obj_t* sensor_temp_labels_[kSensorCount] = {};
     lv_obj_t* sensor_circles_[kSensorCount] = {};
     lv_obj_t* sensor_humidity_labels_[kSensorCount][kHumBoldLayers] = {};
     lv_obj_t* sensor_index_labels_[kSensorCount] = {};
     lv_obj_t* sensor_page_ = nullptr;
-    lv_timer_t* sensor_mock_timer_ = nullptr;
+    lv_obj_t* settings_page_ = nullptr;
+    lv_obj_t* settings_list_ = nullptr;
+    lv_obj_t* settings_empty_label_ = nullptr;
+    lv_obj_t* slot_panel_ = nullptr;
+    lv_obj_t* slot_buttons_[kSensorCount] = {};
+    lv_obj_t* slot_state_labels_[kSensorCount] = {};
     lv_indev_t* touch_indev_ = nullptr;
     int card_index_ = 0;
     bool swiping_ = false;
