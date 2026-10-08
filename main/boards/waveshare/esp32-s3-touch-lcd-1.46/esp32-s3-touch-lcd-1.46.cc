@@ -20,6 +20,7 @@
 #include <cstring>
 #include <string>
 #include <vector>
+#include "bambu_printer.h"
 #include "ble_sensor.h"
 #include "esp_io_expander_tca9554.h"
 #include "i2c_device.h"
@@ -30,9 +31,10 @@
 
 #define TAG "waveshare_lcd_1_46"
 
-// Function cards reachable by swipe: index 0 is the built-in AI screen, 1 is the
-// sensor dashboard built by BuildSensorPage(). More cards can be appended later.
-constexpr int kCardCount = 2;
+// Function cards reachable by swipe: index 0 is the built-in AI screen, 1 is
+// the sensor dashboard built by BuildSensorPage(), 2 is the Bambu printer
+// dashboard built by BuildPrinterPage().
+constexpr int kCardCount = 3;
 
 // Horizontal distance needed to switch card, ~15% of the 412 px panel.
 constexpr int kSwipeThresholdPx = 60;
@@ -66,11 +68,48 @@ constexpr float kHumidityRed = 30.0f;
 // is already linked through lcd_display.cc; the Montserrat sizes come from
 // config.json sdkconfig_append (CONFIG_LV_FONT_MONTSERRAT_40/12=y).
 LV_FONT_DECLARE(font_material_symbols_30_4);
+// Printer status line is one step up from the theme's 16px. Static
+// flash-resident font - safe against the runtime theme font swap (the
+// failure mode documented in BuildSensorPage).
+LV_FONT_DECLARE(font_noto_sans_basic_20_4);
+// MDI printer-3d-nozzle / waves-arrow-up - the nozzle/bed icons BambuSphere
+// shows (font_bambu_icons_20.c in this directory, generated with
+// lv_font_conv from the Apache-2.0 MaterialDesign font).
+LV_FONT_DECLARE(font_bambu_icons_20);
 
 // Settings page (gear overlay): list of discovered XL0801 devices plus the
 // slot picker. The panel is round, so the list is a centred column that
 // stays inside the widest band of the 412x412 framebuffer.
 constexpr int kSettingsListWidth = 280;
+
+// Printer dashboard (card 2): the progress ring hugs the edge of the round
+// dial. A 404px box gives a centreline radius of 195 (outer edge 202, 4px
+// inside the R=206 bezel). The ring's gap sits at the bottom flanking the
+// settings gear: bg angles 108°/72° (wrap, same mechanism as the default
+// 135°/45°) put the two ring ends at (146,391) and (266,391), ~29px either
+// side of the gear's hit box.
+constexpr int kPrinterArcSize = 404;
+constexpr int kPrinterArcWidth = 14;
+constexpr int kPrinterArcGapStart = 108;
+constexpr int kPrinterArcGapEnd = 72;
+// Shared palette: brand green for the ring/progress % and the live status
+// line, deep grey for the ring track.
+constexpr uint32_t kPrinterGreen = 0x21A452;
+constexpr uint32_t kPrinterTrackGrey = 0x333333;
+// MDI glyphs used by BambuSphere for the temp chips (see
+// font_bambu_icons_20.c): printer-3d-nozzle and waves-arrow-up.
+constexpr const char* kMdiNozzleIcon = "\xF3\xB0\xB9\x9B";
+constexpr const char* kMdiBedIcon = "\xF3\xB1\xA1\x9B";
+
+// Printer settings overlay (card 2 gear): the local MQTT connection form.
+// Three rows (IP / serial / access code) are stacked on the upper band; the
+// edit widgets (textarea + keyboard) take over the screen while a row is
+// focused. Keyboard stays inside y=134..310, the widest chord that keeps
+// its bottom corners visible on the round panel.
+constexpr int kPrinterFieldCount = 3;
+constexpr int kPrinterFieldRowWidth = 300;
+constexpr int kPrinterFieldRowHeight = 44;
+constexpr const char* kPrinterFieldNames[kPrinterFieldCount] = {"IP 地址", "序列号", "访问码"};
 
 // 在waveshare_lcd_1_46类之前添加新的显示类
 class CustomLcdDisplay : public SpiLcdDisplay {
@@ -124,6 +163,8 @@ public:
         lv_obj_t* screen = lv_screen_active();
         BuildSensorPage(screen);
         BuildSettingsPage(screen);
+        BuildPrinterPage(screen);
+        BuildPrinterSettings(screen);
         // Swipe detection is NOT registered here: it now hangs off the touch
         // indev (see RegisterSwipeDetection) and is wired up by the board
         // right after the touch driver registers that indev.
@@ -144,6 +185,14 @@ public:
             RefreshSensorLabels(i);
         }
         RefreshScanState();
+
+        // Printer status changes are delivered on the esp_timer task (never
+        // the MQTT task - see bambu_printer.cc); this callback takes the
+        // LVGL lock itself before touching any widget.
+        bambu_printer::SetCallback(
+            [this](const bambu_printer::Status& status) { OnPrinterStatus(status); });
+        printer_host_ = bambu_printer::GetConfig().host;
+        RefreshPrinterUI(bambu_printer::GetStatus());
     }
 
     // Swipe detection on the indev's OWN event list (lv_indev_add_event_cb).
@@ -171,13 +220,19 @@ public:
     void ShowSensorPage() {
         DisplayLockGuard lock(this);
         ESP_LOGI(TAG, "show sensor page requested (MCP)");
-        // ShowCard() silently no-ops while the settings overlay is open
+        // ShowCard() silently no-ops while a settings overlay is open
         // (guard in ShowCard), so close it first - the voice intent wins.
-        if (settings_open_) {
-            CloseSettings();
-        }
-        // card 0 = AI main screen, card 1 = sensor dashboard (kCardCount = 2).
+        CloseAnySettings();
+        // card 0 = AI main screen, card 1 = sensor dashboard.
         ShowCard(1);
+    }
+
+    // Voice/MCP entry point for the Bambu printer dashboard (card 2).
+    void ShowPrinterPage() {
+        DisplayLockGuard lock(this);
+        ESP_LOGI(TAG, "show printer page requested (MCP)");
+        CloseAnySettings();
+        ShowCard(2);
     }
 
 private:
@@ -347,6 +402,242 @@ private:
             }
         }
         lv_obj_set_style_border_color(sensor_circles_[index], ring, 0);
+    }
+
+    // Card 2: the Bambu printer dashboard. Same opaque-page boilerplate as
+    // the sensor dashboard so it covers the AI screen underneath. Layout
+    // inside the edge-to-edge ring, top to bottom: progress % -> status ->
+    // printer IP -> remaining time -> nozzle/bed chips; the gear keeps the
+    // bottom-centre spot it had, with the ring's gap opening around it.
+    void BuildPrinterPage(lv_obj_t* screen) {
+        printer_page_ = lv_obj_create(screen);
+        lv_obj_set_size(printer_page_, width_, height_);
+        lv_obj_align(printer_page_, LV_ALIGN_CENTER, 0, 0);
+        lv_obj_set_style_bg_color(printer_page_, lv_color_hex(0x000000), 0);
+        lv_obj_set_style_bg_opa(printer_page_, LV_OPA_COVER, 0);
+        lv_obj_set_style_border_width(printer_page_, 0, 0);
+        lv_obj_set_style_radius(printer_page_, 0, 0);
+        lv_obj_set_style_pad_all(printer_page_, 0, 0);
+        lv_obj_set_scrollbar_mode(printer_page_, LV_SCROLLBAR_MODE_OFF);
+        lv_obj_remove_flag(printer_page_, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_add_flag(printer_page_, LV_OBJ_FLAG_HIDDEN);
+
+        // Progress ring on the dial edge: deep-grey track, brand-green
+        // indicator, gap opening around the bottom gear. Created first so
+        // every label below draws on top of it.
+        printer_arc_ = lv_arc_create(printer_page_);
+        lv_obj_set_size(printer_arc_, kPrinterArcSize, kPrinterArcSize);
+        lv_obj_align(printer_arc_, LV_ALIGN_CENTER, 0, 0);
+        lv_arc_set_range(printer_arc_, 0, 100);
+        lv_arc_set_bg_angles(printer_arc_, kPrinterArcGapStart, kPrinterArcGapEnd);
+        lv_arc_set_value(printer_arc_, 0);
+        lv_obj_set_style_bg_opa(printer_arc_, LV_OPA_TRANSP, 0);
+        lv_obj_set_style_border_width(printer_arc_, 0, 0);
+        lv_obj_set_style_pad_all(printer_arc_, 0, 0);
+        lv_obj_set_style_arc_width(printer_arc_, kPrinterArcWidth, LV_PART_MAIN);
+        lv_obj_set_style_arc_color(printer_arc_, lv_color_hex(kPrinterTrackGrey), LV_PART_MAIN);
+        lv_obj_set_style_arc_width(printer_arc_, kPrinterArcWidth, LV_PART_INDICATOR);
+        lv_obj_set_style_arc_color(printer_arc_, lv_color_hex(kPrinterGreen), LV_PART_INDICATOR);
+        // The theme draws the value knob as a blue dot at the indicator end;
+        // the design wants a bare ring, so make every part of it invisible.
+        lv_obj_set_style_bg_opa(printer_arc_, LV_OPA_TRANSP, LV_PART_KNOB);
+        lv_obj_set_style_border_width(printer_arc_, 0, LV_PART_KNOB);
+        lv_obj_set_style_outline_width(printer_arc_, 0, LV_PART_KNOB);
+        lv_obj_set_style_shadow_width(printer_arc_, 0, LV_PART_KNOB);
+        lv_obj_remove_flag(printer_arc_, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_remove_flag(printer_arc_, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_set_scrollbar_mode(printer_arc_, LV_SCROLLBAR_MODE_OFF);
+
+        // Progress % - top of the info stack, static Montserrat (flash
+        // resident, immune to the theme font swap), brand green.
+        printer_progress_label_ = lv_label_create(printer_page_);
+        lv_obj_set_style_text_font(printer_progress_label_, &lv_font_montserrat_40, 0);
+        lv_obj_set_style_text_color(printer_progress_label_, lv_color_hex(kPrinterGreen), 0);
+        lv_label_set_text(printer_progress_label_, "--");
+        lv_obj_align(printer_progress_label_, LV_ALIGN_TOP_MID, 0, 96);
+
+        // Status line - middle of the ring, one size up (20px noto), green
+        // in every live state (red kept only for a concrete print failure).
+        // Static font, so nothing to coordinate with the theme swap; the
+        // 20px noto is only referenced here, the linker pulls the glyph
+        // blob in on demand.
+        printer_state_label_ = lv_label_create(printer_page_);
+        lv_obj_set_style_text_font(printer_state_label_, &font_noto_sans_basic_20_4, 0);
+        lv_obj_set_style_text_color(printer_state_label_, lv_color_hex(0x888888), 0);
+        lv_label_set_text(printer_state_label_, "--");
+        lv_obj_align(printer_state_label_, LV_ALIGN_TOP_MID, 0, 170);
+
+        // Printer IP right under the status (grey); setup hint text shares
+        // this label while unconfigured. Inherits the screen font.
+        printer_hint_label_ = lv_label_create(printer_page_);
+        lv_obj_set_style_text_color(printer_hint_label_, lv_color_hex(0x888888), 0);
+        lv_label_set_text(printer_hint_label_, "");
+        lv_obj_align(printer_hint_label_, LV_ALIGN_TOP_MID, 0, 206);
+
+        printer_remain_label_ = lv_label_create(printer_page_);
+        lv_obj_set_style_text_color(printer_remain_label_, lv_color_hex(0x999999), 0);
+        lv_label_set_text(printer_remain_label_, "");
+        lv_obj_align(printer_remain_label_, LV_ALIGN_TOP_MID, 0, 234);
+
+        // Nozzle / bed chips low in the ring: MDI icon (BambuSphere's pair)
+        // + value in a small transparent flex row. Row centres (x=146/266,
+        // y=296..322) clear the ring band and stay inside the visible chord.
+        auto build_temp_chip = [this](const char* icon, lv_obj_t** value_label, int x_offset) {
+            lv_obj_t* row = lv_obj_create(printer_page_);
+            lv_obj_set_size(row, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
+            lv_obj_set_style_bg_opa(row, LV_OPA_TRANSP, 0);
+            lv_obj_set_style_border_width(row, 0, 0);
+            lv_obj_set_style_radius(row, 0, 0);
+            lv_obj_set_style_pad_all(row, 0, 0);
+            lv_obj_set_style_pad_column(row, 5, 0);
+            lv_obj_set_scrollbar_mode(row, LV_SCROLLBAR_MODE_OFF);
+            lv_obj_remove_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+            lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
+            lv_obj_set_flex_align(row, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER,
+                                  LV_FLEX_ALIGN_CENTER);
+
+            lv_obj_t* icon_label = lv_label_create(row);
+            lv_obj_set_style_text_font(icon_label, &font_bambu_icons_20, 0);
+            lv_obj_set_style_text_color(icon_label, lv_color_hex(0xCCCCCC), 0);
+            lv_label_set_text(icon_label, icon);
+
+            lv_obj_t* value = lv_label_create(row);
+            lv_obj_set_style_text_color(value, lv_color_hex(0xFFFFFF), 0);
+            lv_label_set_text(value, "--°C");
+            *value_label = value;
+
+            lv_obj_align(row, LV_ALIGN_TOP_MID, x_offset, 296);
+        };
+        build_temp_chip(kMdiNozzleIcon, &printer_nozzle_label_, -60);
+        build_temp_chip(kMdiBedIcon, &printer_bed_label_, 60);
+
+        // Gear = printer settings; position unchanged (bottom centre), same
+        // enlarged hit area as card 1's gear. Created last so it draws -
+        // and hit-tests - above the ring.
+        lv_obj_t* settings_icon = lv_label_create(printer_page_);
+        lv_obj_set_style_text_font(settings_icon, &font_material_symbols_30_4, 0);
+        lv_obj_set_style_text_color(settings_icon, lv_color_hex(0xAAAAAA), 0);
+        lv_label_set_text(settings_icon, MATERIAL_SYMBOLS_SETTINGS);
+        lv_obj_set_style_pad_hor(settings_icon, 16, 0);
+        lv_obj_set_style_pad_bottom(settings_icon, 12, 0);
+        lv_obj_align(settings_icon, LV_ALIGN_BOTTOM_MID, 0, 4);
+        lv_obj_add_flag(settings_icon, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_add_event_cb(settings_icon, PrinterSettingsIconCb, LV_EVENT_CLICKED, this);
+    }
+
+    static const char* PrinterStateText(const char* state) {
+        if (state[0] == '\0') {
+            return "已连接";  // session up, first report not parsed yet
+        }
+        if (strcmp(state, "RUNNING") == 0) {
+            return "打印中";
+        }
+        if (strcmp(state, "PREPARE") == 0 || strcmp(state, "INIT") == 0 ||
+            strcmp(state, "SLICING") == 0) {
+            return "准备中";
+        }
+        if (strcmp(state, "PAUSE") == 0 || strcmp(state, "PAUSED") == 0) {
+            return "已暂停";
+        }
+        if (strcmp(state, "FINISH") == 0) {
+            return "已完成";
+        }
+        if (strcmp(state, "FAILED") == 0) {
+            return "打印错误";
+        }
+        if (strcmp(state, "IDLE") == 0) {
+            return "空闲";
+        }
+        if (strcmp(state, "OFFLINE") == 0) {
+            return "打印机离线";
+        }
+        return state;  // unknown raw state, show the English original
+    }
+
+    // The status line is the brand green in every live state (design spec);
+    // only a concrete print failure keeps the red alarm.
+    static lv_color_t PrinterStateColor(const char* state) {
+        if (strcmp(state, "FAILED") == 0) {
+            return lv_color_hex(0xFF4000);  // red
+        }
+        return lv_color_hex(kPrinterGreen);
+    }
+
+    // Single render path for the printer card. Called from SetupUI with the
+    // initial snapshot (lock already held) and from OnPrinterStatus.
+    void RefreshPrinterUI(const bambu_printer::Status& status) {
+        if (printer_page_ == nullptr) {
+            return;
+        }
+
+        const char* state_text = "--";
+        lv_color_t color = lv_color_hex(0x888888);
+        const char* hint = "";
+        switch (status.conn) {
+            case bambu_printer::Conn::kNotConfigured:
+                state_text = "未配置";
+                hint = "请点右下角设置填写打印机信息";
+                break;
+            case bambu_printer::Conn::kConnecting:
+                state_text = "连接中";
+                hint = printer_host_.c_str();
+                break;
+            case bambu_printer::Conn::kOffline:
+                state_text = "打印机离线";
+                hint = printer_host_.c_str();
+                break;
+            case bambu_printer::Conn::kOnline:
+                state_text = PrinterStateText(status.state);
+                color = PrinterStateColor(status.state);
+                hint = printer_host_.c_str();
+                break;
+        }
+        lv_label_set_text(printer_state_label_, state_text);
+        lv_obj_set_style_text_color(printer_state_label_, color, 0);
+        lv_label_set_text(printer_hint_label_, hint);
+
+        const bool online = status.conn == bambu_printer::Conn::kOnline;
+        char buf[32];
+        if (online && status.progress_percent >= 0) {
+            snprintf(buf, sizeof(buf), "%d%%", status.progress_percent);
+            lv_label_set_text(printer_progress_label_, buf);
+            lv_arc_set_value(printer_arc_, status.progress_percent);
+        } else {
+            lv_label_set_text(printer_progress_label_, "--");
+            lv_arc_set_value(printer_arc_, 0);
+        }
+        lv_obj_set_style_arc_color(printer_arc_, online ? color : lv_color_hex(0x555555),
+                                   LV_PART_INDICATOR);
+
+        if (online && status.remaining_minutes > 0) {
+            snprintf(buf, sizeof(buf), "剩余 %d:%02d", status.remaining_minutes / 60,
+                     status.remaining_minutes % 60);
+        } else {
+            buf[0] = '\0';
+        }
+        lv_label_set_text(printer_remain_label_, buf);
+
+        if (online && status.nozzle_temp >= 0.0f) {
+            snprintf(buf, sizeof(buf), "%.0f°C", status.nozzle_temp);
+        } else {
+            snprintf(buf, sizeof(buf), "--°C");
+        }
+        lv_label_set_text(printer_nozzle_label_, buf);
+
+        if (online && status.bed_temp >= 0.0f) {
+            snprintf(buf, sizeof(buf), "%.0f°C", status.bed_temp);
+        } else {
+            snprintf(buf, sizeof(buf), "--°C");
+        }
+        lv_label_set_text(printer_bed_label_, buf);
+    }
+
+    // esp_timer task entry point (never the MQTT task - the deferred delivery
+    // is what lets the UI restart the client without deadlocking, see
+    // bambu_printer.cc). Takes the LVGL lock itself.
+    void OnPrinterStatus(const bambu_printer::Status& status) {
+        DisplayLockGuard lock(this);
+        RefreshPrinterUI(status);
     }
 
     // NimBLE host-task entry point: refresh bound circles and (while the
@@ -650,6 +941,328 @@ private:
         lv_obj_add_event_cb(cancel_btn, BackButtonCb, LV_EVENT_CLICKED, this);
     }
 
+    // Card 2 overlay: local MQTT connection form (IP / serial / access
+    // code) edited with the LVGL keyboard. Built AFTER the printer page so
+    // its opaque background covers it while open.
+    void BuildPrinterSettings(lv_obj_t* screen) {
+        printer_settings_page_ = lv_obj_create(screen);
+        lv_obj_set_size(printer_settings_page_, width_, height_);
+        lv_obj_align(printer_settings_page_, LV_ALIGN_CENTER, 0, 0);
+        lv_obj_set_style_bg_color(printer_settings_page_, lv_color_hex(0x000000), 0);
+        lv_obj_set_style_bg_opa(printer_settings_page_, LV_OPA_COVER, 0);
+        lv_obj_set_style_border_width(printer_settings_page_, 0, 0);
+        lv_obj_set_style_radius(printer_settings_page_, 0, 0);
+        lv_obj_set_style_pad_all(printer_settings_page_, 0, 0);
+        lv_obj_set_scrollbar_mode(printer_settings_page_, LV_SCROLLBAR_MODE_OFF);
+        lv_obj_remove_flag(printer_settings_page_, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_add_flag(printer_settings_page_, LV_OBJ_FLAG_HIDDEN);
+
+        lv_obj_t* title = lv_label_create(printer_settings_page_);
+        lv_obj_set_style_text_color(title, lv_color_hex(0xFFFFFF), 0);
+        lv_label_set_text(title, "打印机设置");
+        lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 28);
+
+        for (int i = 0; i < kPrinterFieldCount; ++i) {
+            lv_obj_t* row = lv_obj_create(printer_settings_page_);
+            lv_obj_set_size(row, kPrinterFieldRowWidth, kPrinterFieldRowHeight);
+            lv_obj_align(row, LV_ALIGN_TOP_MID, 0, 64 + i * (kPrinterFieldRowHeight + 6));
+            lv_obj_set_style_bg_color(row, lv_color_hex(0x161616), 0);
+            lv_obj_set_style_bg_opa(row, LV_OPA_COVER, 0);
+            lv_obj_set_style_border_width(row, 0, 0);
+            lv_obj_set_style_radius(row, 12, 0);
+            lv_obj_set_style_pad_hor(row, 14, 0);
+            lv_obj_set_scrollbar_mode(row, LV_SCROLLBAR_MODE_OFF);
+            lv_obj_remove_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+            lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
+            lv_obj_set_flex_align(row, LV_FLEX_ALIGN_SPACE_BETWEEN, LV_FLEX_ALIGN_CENTER,
+                                  LV_FLEX_ALIGN_CENTER);
+            lv_obj_add_flag(row, LV_OBJ_FLAG_CLICKABLE);
+            lv_obj_add_event_cb(row, PrinterFieldCb, LV_EVENT_CLICKED, this);
+
+            lv_obj_t* label = lv_label_create(row);
+            lv_obj_set_style_text_color(label, lv_color_hex(0x888888), 0);
+            lv_label_set_text(label, kPrinterFieldNames[i]);
+
+            lv_obj_t* value = lv_label_create(row);
+            lv_obj_set_style_text_color(value, lv_color_hex(0xFFFFFF), 0);
+            // Fixed width + ellipsis: a 64-char host must not push the row
+            // label off the visible chord of the round panel.
+            lv_obj_set_width(value, 190);
+            lv_label_set_long_mode(value, LV_LABEL_LONG_DOT);
+            lv_label_set_text(value, "未填写");
+            printer_field_value_labels_[i] = value;
+            printer_field_rows_[i] = row;
+        }
+
+        printer_form_hint_ = lv_label_create(printer_settings_page_);
+        lv_obj_set_style_text_color(printer_form_hint_, lv_color_hex(0x666666), 0);
+        lv_obj_set_width(printer_form_hint_, 300);
+        lv_label_set_long_mode(printer_form_hint_, LV_LABEL_LONG_WRAP);
+        lv_label_set_text(printer_form_hint_, "点按条目填写，保存后立即连接");
+        lv_obj_align(printer_form_hint_, LV_ALIGN_TOP_MID, 0, 216);
+
+        // Edit widgets (hidden until a row is tapped): textarea on the upper
+        // band where the rows were, keyboard in the wide middle band
+        // (y=134..310 stays inside the visible circle at 340px wide).
+        printer_ta_ = lv_textarea_create(printer_settings_page_);
+        lv_obj_set_size(printer_ta_, 320, 48);
+        lv_obj_align(printer_ta_, LV_ALIGN_TOP_MID, 0, 76);
+        lv_textarea_set_max_length(printer_ta_, 64);
+        lv_obj_set_style_bg_color(printer_ta_, lv_color_hex(0x161616), 0);
+        lv_obj_set_style_text_color(printer_ta_, lv_color_hex(0xFFFFFF), 0);
+        lv_obj_set_style_border_color(printer_ta_, lv_color_hex(0x2F6BFF), 0);
+        lv_obj_add_event_cb(printer_ta_, PrinterTaCb, LV_EVENT_VALUE_CHANGED, this);
+        lv_obj_add_flag(printer_ta_, LV_OBJ_FLAG_HIDDEN);
+
+        printer_kb_ = lv_keyboard_create(printer_settings_page_);
+        lv_obj_set_size(printer_kb_, 340, 176);
+        lv_obj_align(printer_kb_, LV_ALIGN_TOP_MID, 0, 134);
+        lv_keyboard_set_textarea(printer_kb_, printer_ta_);
+        // The keyboard's checkmark key only fires LV_EVENT_READY (and the KB
+        // icon / close fires LV_EVENT_CANCEL) - lv_keyboard's default handler
+        // changes nothing about our layout, so without these the edit window
+        // could only be left through the 完成 button and users got stuck
+        // after pressing ✓. The Enter/newline key forwards READY to the
+        // textarea alone, hence the extra registration there. Both call sites
+        // are guarded by printer_focus_, double-fire is a no-op.
+        lv_obj_add_event_cb(printer_kb_, PrinterKbReadyCb, LV_EVENT_READY, this);
+        lv_obj_add_event_cb(printer_kb_, PrinterKbReadyCb, LV_EVENT_CANCEL, this);
+        lv_obj_add_event_cb(printer_ta_, PrinterKbReadyCb, LV_EVENT_READY, this);
+        lv_obj_add_flag(printer_kb_, LV_OBJ_FLAG_HIDDEN);
+
+        // Bottom band (proven hit zone on this round panel): save/back while
+        // browsing rows; "done" replaces save while editing. The two slots
+        // never show at once.
+        printer_save_btn_ = lv_button_create(printer_settings_page_);
+        lv_obj_set_size(printer_save_btn_, 96, 44);
+        lv_obj_align(printer_save_btn_, LV_ALIGN_BOTTOM_MID, -56, 2);
+        lv_obj_set_style_bg_color(printer_save_btn_, lv_color_hex(0x2F6BFF), 0);
+        lv_obj_t* save_label = lv_label_create(printer_save_btn_);
+        lv_label_set_text(save_label, "保存");
+        lv_obj_center(save_label);
+        lv_obj_add_event_cb(printer_save_btn_, PrinterSaveCb, LV_EVENT_CLICKED, this);
+
+        printer_done_btn_ = lv_button_create(printer_settings_page_);
+        lv_obj_set_size(printer_done_btn_, 96, 44);
+        lv_obj_align(printer_done_btn_, LV_ALIGN_BOTTOM_MID, -56, 2);
+        lv_obj_set_style_bg_color(printer_done_btn_, lv_color_hex(0x2F6BFF), 0);
+        lv_obj_t* done_label = lv_label_create(printer_done_btn_);
+        lv_label_set_text(done_label, "完成");
+        lv_obj_center(done_label);
+        lv_obj_add_event_cb(printer_done_btn_, PrinterDoneCb, LV_EVENT_CLICKED, this);
+        lv_obj_add_flag(printer_done_btn_, LV_OBJ_FLAG_HIDDEN);
+
+        lv_obj_t* back_btn = lv_button_create(printer_settings_page_);
+        lv_obj_set_size(back_btn, 96, 44);
+        lv_obj_align(back_btn, LV_ALIGN_BOTTOM_MID, 56, 2);
+        lv_obj_set_style_bg_color(back_btn, lv_color_hex(0x333333), 0);
+        lv_obj_t* back_label = lv_label_create(back_btn);
+        lv_label_set_text(back_label, "返回");
+        lv_obj_center(back_label);
+        lv_obj_add_event_cb(back_btn, PrinterBackCb, LV_EVENT_CLICKED, this);
+    }
+
+    static void PrinterSettingsIconCb(lv_event_t* e) {
+        auto* self = static_cast<CustomLcdDisplay*>(lv_event_get_user_data(e));
+        self->OpenPrinterSettings();
+    }
+
+    static void PrinterFieldCb(lv_event_t* e) {
+        auto* self = static_cast<CustomLcdDisplay*>(lv_event_get_user_data(e));
+        lv_obj_t* row = static_cast<lv_obj_t*>(lv_event_get_target(e));
+        for (int i = 0; i < kPrinterFieldCount; ++i) {
+            if (self->printer_field_rows_[i] == row) {
+                self->FocusPrinterField(i);
+                return;
+            }
+        }
+    }
+
+    static void PrinterTaCb(lv_event_t* e) {
+        auto* self = static_cast<CustomLcdDisplay*>(lv_event_get_user_data(e));
+        if (self->printer_focus_ < 0 || self->printer_focus_ >= kPrinterFieldCount) {
+            return;
+        }
+        const char* text = lv_textarea_get_text(self->printer_ta_);
+        self->PendingPrinterField(self->printer_focus_) = (text != nullptr) ? text : "";
+    }
+
+    static void PrinterSaveCb(lv_event_t* e) {
+        auto* self = static_cast<CustomLcdDisplay*>(lv_event_get_user_data(e));
+        self->SavePrinterSettings();
+    }
+
+    static void PrinterDoneCb(lv_event_t* e) {
+        auto* self = static_cast<CustomLcdDisplay*>(lv_event_get_user_data(e));
+        self->StopPrinterEditing();
+    }
+
+    static void PrinterBackCb(lv_event_t* e) {
+        auto* self = static_cast<CustomLcdDisplay*>(lv_event_get_user_data(e));
+        self->ClosePrinterSettings();
+    }
+
+    // Keyboard ✓ (LV_EVENT_READY) / close icon (LV_EVENT_CANCEL): leave the
+    // edit window and return to the form rows - same as the 完成 button.
+    // Pending values are already synced per keystroke by PrinterTaCb, so
+    // there is nothing to flush here; 保存 still persists explicitly.
+    static void PrinterKbReadyCb(lv_event_t* e) {
+        auto* self = static_cast<CustomLcdDisplay*>(lv_event_get_user_data(e));
+        if (self->printer_focus_ < 0) {
+            return;  // already back on the rows (READY can arrive twice)
+        }
+        self->StopPrinterEditing();
+    }
+
+    std::string& PendingPrinterField(int index) {
+        switch (index) {
+            case 0:
+                return pending_host_;
+            case 1:
+                return pending_sn_;
+            default:
+                return pending_code_;
+        }
+    }
+
+    void RefreshPrinterFieldLabels() {
+        lv_label_set_text(printer_field_value_labels_[0],
+                          pending_host_.empty() ? "未填写" : pending_host_.c_str());
+        lv_label_set_text(printer_field_value_labels_[1],
+                          pending_sn_.empty() ? "未填写" : pending_sn_.c_str());
+        // Mask the access code in the row list; the focused textarea is in
+        // password mode while it is being typed.
+        lv_label_set_text(printer_field_value_labels_[2],
+                          pending_code_.empty() ? "未填写" : "******");
+    }
+
+    void FocusPrinterField(int index) {
+        if (index < 0 || index >= kPrinterFieldCount) {
+            return;
+        }
+        printer_focus_ = index;
+        // The round panel has no room for the rows AND the edit widgets at
+        // once; "完成" brings the rows back (switching fields = done, tap
+        // the other row).
+        for (int i = 0; i < kPrinterFieldCount; ++i) {
+            lv_obj_add_flag(printer_field_rows_[i], LV_OBJ_FLAG_HIDDEN);
+        }
+        lv_obj_add_flag(printer_form_hint_, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_remove_flag(printer_ta_, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_remove_flag(printer_kb_, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_add_flag(printer_save_btn_, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_remove_flag(printer_done_btn_, LV_OBJ_FLAG_HIDDEN);
+
+        lv_textarea_set_password_mode(printer_ta_, index == 2);
+        lv_textarea_set_text(printer_ta_, PendingPrinterField(index).c_str());
+        // Digits-first pad for IP and access code, letters-first for the SN.
+        lv_keyboard_set_mode(printer_kb_,
+                             index == 1 ? LV_KEYBOARD_MODE_TEXT_LOWER : LV_KEYBOARD_MODE_NUMBER);
+        ESP_LOGI(TAG, "printer field %d focused", index);
+    }
+
+    void StopPrinterEditing() {
+        printer_focus_ = -1;
+        if (printer_settings_page_ == nullptr) {
+            return;
+        }
+        for (int i = 0; i < kPrinterFieldCount; ++i) {
+            lv_obj_remove_flag(printer_field_rows_[i], LV_OBJ_FLAG_HIDDEN);
+        }
+        lv_obj_remove_flag(printer_form_hint_, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_add_flag(printer_ta_, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_add_flag(printer_kb_, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_remove_flag(printer_save_btn_, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_add_flag(printer_done_btn_, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_set_style_text_color(printer_form_hint_, lv_color_hex(0x666666), 0);
+        lv_label_set_text(printer_form_hint_, "点按条目填写，保存后立即连接");
+        RefreshPrinterFieldLabels();
+    }
+
+    static bool AllChars(const std::string& value, const char* allowed) {
+        for (char ch : value) {
+            if (strchr(allowed, ch) == nullptr) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    // Returns an error message (shown in the form hint) or nullptr when the
+    // three pending values are acceptable.
+    const char* ValidatePrinterFields() {
+        if (pending_host_.empty() || pending_sn_.empty() || pending_code_.empty()) {
+            return "请填写完整信息";
+        }
+        if (pending_host_.size() > 64 || !AllChars(pending_host_, "0123456789abcdefABCDEF.-")) {
+            return "IP 地址格式不对（数字/字母/点/横线）";
+        }
+        if (pending_sn_.size() < 4 || pending_sn_.size() > 24 ||
+            !AllChars(pending_sn_,
+                      "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ")) {
+            return "序列号格式不对（4-24 位字母数字）";
+        }
+        if (pending_code_.size() < 4 || pending_code_.size() > 8 ||
+            !AllChars(pending_code_, "0123456789")) {
+            return "访问码应为 4-8 位数字";
+        }
+        return nullptr;
+    }
+
+    void SavePrinterSettings() {
+        const char* error = ValidatePrinterFields();
+        if (error == nullptr &&
+            !bambu_printer::SetConfig(pending_host_, pending_sn_, pending_code_)) {
+            error = "保存失败，请重试";
+        }
+        if (error != nullptr) {
+            // Back to browse mode so the hint row is actually visible.
+            StopPrinterEditing();
+            lv_obj_set_style_text_color(printer_form_hint_, lv_color_hex(0xFF4000), 0);
+            lv_label_set_text(printer_form_hint_, error);
+            ESP_LOGW(TAG, "printer settings rejected: %s", error);
+            return;
+        }
+        printer_host_ = pending_host_;
+        RefreshPrinterUI(bambu_printer::GetStatus());
+        ClosePrinterSettings();
+    }
+
+    void OpenPrinterSettings() {
+        if (printer_settings_open_ || printer_settings_page_ == nullptr) {
+            return;
+        }
+        ESP_LOGI(TAG, "printer settings opened");
+        bambu_printer::Config cfg = bambu_printer::GetConfig();
+        pending_host_ = cfg.host;
+        pending_sn_ = cfg.serial;
+        pending_code_ = cfg.access_code;
+        StopPrinterEditing();  // browse mode with fresh row values
+        printer_settings_open_ = true;
+        settings_open_ = true;
+        lv_obj_remove_flag(printer_settings_page_, LV_OBJ_FLAG_HIDDEN);
+    }
+
+    void ClosePrinterSettings() {
+        if (!printer_settings_open_) {
+            return;
+        }
+        ESP_LOGI(TAG, "printer settings closed");
+        StopPrinterEditing();
+        printer_settings_open_ = false;
+        settings_open_ = false;
+        lv_obj_add_flag(printer_settings_page_, LV_OBJ_FLAG_HIDDEN);
+    }
+
+    // Whichever settings overlay is open (sensor gear vs printer gear).
+    void CloseAnySettings() {
+        if (printer_settings_open_) {
+            ClosePrinterSettings();
+        } else {
+            CloseSettings();
+        }
+    }
+
     // One row per unique XL0801; called from the NimBLE host task (holds the
     // LVGL lock) while the settings page is open. The header shows the live
     // broadcast reading instead of the model name - all nearby sensors are
@@ -745,11 +1358,17 @@ private:
         // The settings overlay owns the screen while open. A deliberate
         // right swipe closes it (same direction as going "back" on the
         // dashboard); everything else is swallowed so horizontal drags on
-        // the list cannot flip cards.
+        // the list cannot flip cards. While the printer keyboard is up every
+        // gesture is swallowed outright: a rightward flick across the keys
+        // would otherwise close the page and discard the edit.
         if (settings_open_) {
+            if (printer_settings_open_ && printer_focus_ >= 0) {
+                ESP_LOGI(TAG, "swipe ignored (printer editing)");
+                return;
+            }
             if (LV_ABS(dx) >= LV_ABS(dy) && dx >= kSwipeThresholdPx) {
                 ESP_LOGI(TAG, "swipe right closes settings");
-                CloseSettings();
+                CloseAnySettings();
             } else {
                 ESP_LOGI(TAG, "swipe ignored (settings open)");
             }
@@ -776,16 +1395,21 @@ private:
             return;
         }
         // Registered in the board constructor, swipe events can arrive before
-        // SetupUI() built the page; ignore them instead of advancing
+        // SetupUI() built the pages; ignore them instead of advancing
         // card_index_ with no page to show.
-        if (sensor_page_ == nullptr || settings_open_) {
+        if (sensor_page_ == nullptr || printer_page_ == nullptr || settings_open_) {
             return;
         }
         card_index_ = index;
-        if (card_index_ == 0) {
-            lv_obj_add_flag(sensor_page_, LV_OBJ_FLAG_HIDDEN);
-        } else {
+        // Exactly one card page visible at a time. Card 0 shows none of them
+        // - the AI main screen is the base UI itself and is never hidden
+        // (hiding its children would break SetEmotion/SetPreviewImage state).
+        lv_obj_add_flag(sensor_page_, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_add_flag(printer_page_, LV_OBJ_FLAG_HIDDEN);
+        if (card_index_ == 1) {
             lv_obj_remove_flag(sensor_page_, LV_OBJ_FLAG_HIDDEN);
+        } else if (card_index_ == 2) {
+            lv_obj_remove_flag(printer_page_, LV_OBJ_FLAG_HIDDEN);
         }
         // Arm/disarm the BLE scan with the visible card.
         RefreshScanState();
@@ -813,6 +1437,34 @@ private:
     lv_obj_t* slot_panel_ = nullptr;
     lv_obj_t* slot_buttons_[kSensorCount] = {};
     lv_obj_t* slot_state_labels_[kSensorCount] = {};
+    // Card 2 (printer dashboard) widgets.
+    lv_obj_t* printer_page_ = nullptr;
+    lv_obj_t* printer_state_label_ = nullptr;
+    lv_obj_t* printer_arc_ = nullptr;
+    lv_obj_t* printer_progress_label_ = nullptr;
+    lv_obj_t* printer_remain_label_ = nullptr;
+    lv_obj_t* printer_nozzle_label_ = nullptr;
+    lv_obj_t* printer_bed_label_ = nullptr;
+    lv_obj_t* printer_hint_label_ = nullptr;
+    // Card 2 settings overlay widgets.
+    lv_obj_t* printer_settings_page_ = nullptr;
+    lv_obj_t* printer_field_rows_[kPrinterFieldCount] = {};
+    lv_obj_t* printer_field_value_labels_[kPrinterFieldCount] = {};
+    lv_obj_t* printer_form_hint_ = nullptr;
+    lv_obj_t* printer_ta_ = nullptr;
+    lv_obj_t* printer_kb_ = nullptr;
+    lv_obj_t* printer_save_btn_ = nullptr;
+    lv_obj_t* printer_done_btn_ = nullptr;
+    // Pending (not yet persisted) form values; synced from the textarea on
+    // every keystroke, committed by SavePrinterSettings().
+    std::string pending_host_;
+    std::string pending_sn_;
+    std::string pending_code_;
+    int printer_focus_ = -1;  // row being edited, -1 = browse mode
+    // Cached configured printer IP for the card hint (avoids re-reading NVS
+    // on every status refresh).
+    std::string printer_host_;
+    bool printer_settings_open_ = false;
     lv_indev_t* touch_indev_ = nullptr;
     int card_index_ = 0;
     bool swiping_ = false;
@@ -1034,9 +1686,42 @@ private:
                                display_->ShowSensorPage();
                                return true;
                            });
+        mcp_server.AddTool("self.screen.show_printer",
+                           "Switch the display to the Bambu 3D printer status page (print "
+                           "progress, remaining time, nozzle/bed temperatures). Call when the "
+                           "user wants to view the printer status (e.g. \"我要查看打印机\").",
+                           PropertyList(), [this](const PropertyList& properties) -> ReturnValue {
+                               display_->ShowPrinterPage();
+                               return true;
+                           });
     }
 
 public:
+    // Wrap the Application's network callback instead of replacing it: the
+    // Bambu MQTT client starts 2s after the station gets its IP (delaying
+    // keeps our TLS handshake apart from the XiaoZhi cloud protocol's first
+    // connect) and tears down on disconnect / Wi-Fi config mode - the config
+    // SoftAP must stay radio-quiet, the same reason BLE scanning is parked
+    // there.
+    void SetNetworkEventCallback(NetworkEventCallback callback) override {
+        WifiBoard::SetNetworkEventCallback([callback](NetworkEvent event, const std::string& data) {
+            switch (event) {
+                case NetworkEvent::Connected:
+                    bambu_printer::OnNetworkUp();
+                    break;
+                case NetworkEvent::Disconnected:
+                case NetworkEvent::WifiConfigModeEnter:
+                    bambu_printer::OnNetworkDown();
+                    break;
+                default:
+                    break;
+            }
+            if (callback) {
+                callback(event, data);
+            }
+        });
+    }
+
     CustomBoard() {
         InitializeI2c();
         InitializeTca9554();

@@ -9,7 +9,12 @@
                 "CONFIG_LV_FONT_MONTSERRAT_40=y",
                 "CONFIG_LV_FONT_MONTSERRAT_12=y",
                 "CONFIG_BT_ENABLED=y",
-                "CONFIG_BT_NIMBLE_ENABLED=y"
+                "CONFIG_BT_NIMBLE_ENABLED=y",
+                "CONFIG_LV_USE_KEYBOARD=y",
+                "CONFIG_ESP_TLS_INSECURE=y",
+                "CONFIG_ESP_TLS_SKIP_SERVER_CERT_VERIFY=y",
+                "CONFIG_MQTT_BUFFERS_ON_EXTERNAL_MEMORY=y",
+                "CONFIG_MQTT_TASK_STACK_ON_EXTERNAL_MEMORY=y"
             ]
         }
     ]

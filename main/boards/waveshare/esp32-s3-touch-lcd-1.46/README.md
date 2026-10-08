@@ -36,9 +36,11 @@ https://www.waveshare.net/shop/ESP32-S3-Touch-LCD-1.46B.htm
 固件本身没有任何滑动手势实现（全仓库 0 处 `LV_EVENT_GESTURE`），本板在
 `CustomLcdDisplay` 里自建了一套：
 
-- **卡片**：`kCardCount = 2`。card 0 = 原生 AI 主屏；card 1 = `BuildSensorPage()`
-  创建的满屏黑底页面（四圆温湿度仪表盘，最后创建，层级最高，不透明即可盖住主屏）。
-  新增卡片时把 `kCardCount` 加一并扩展 `BuildSensorPage()`/`ShowCard()`。
+- **卡片**：`kCardCount = 3`。card 0 = 原生 AI 主屏；card 1 = `BuildSensorPage()`
+  创建的满屏黑底页面（四圆温湿度仪表盘）；card 2 = `BuildPrinterPage()` 创建的
+  拓竹打印机状态页。`ShowCard()` 按索引表显隐（先隐藏所有卡片页再显示目标页；
+  card 0 = 全隐藏露出主屏）。新增卡片时把 `kCardCount` 加一、加一个
+  `Build*Page()` 并扩展 `ShowCard()` 的显隐表。
 - **手势**：`ShowCard/NextCard/PrevCard` 只切换卡片页的 `LV_OBJ_FLAG_HIDDEN`，
   不隐藏主屏子对象 —— 否则会破坏 `SetEmotion()`/`SetPreviewImage()` 对
   `emoji_box_` 的显隐状态管理。
@@ -141,5 +143,76 @@ https://www.waveshare.net/shop/ESP32-S3-Touch-LCD-1.46B.htm
   转发到 indev 列表，与命中对象、滚动状态均无关。`PRESSING` 不在转发名单内，
   因此手势位移按**按下点 → 抬手点**的差值计算（驱动在 release 时保留
   `s_last_x/y` 为最后接触点）。
+
+#### 第三屏：拓竹打印机状态页（本地 MQTT）
+
+- **数据模块** `bambu_printer.h/.cc`（板级目录，glob 自动编译）：独立的第二个
+  `esp_mqtt_client` 直连打印机自带 broker —— **TLS 8883 / MQTT 3.1.1 /
+  username=`bblp` / password=LAN 访问码 / client_id=`xiaozhi-<随机>`**，
+  订阅 `device/<SN>/report` 解析 `print.gcode_state / mc_percent /
+  mc_remaining_time / nozzle_temper / bed_temper`（增量合并，缺字段保留旧值），
+  订阅确认后发 `pushing/start` 并在 1s/60s 周期发 `pushall` 全量补拉。
+  与小智云协议的 MQTT 客户端共存（`EspNetwork::CreateMqtt()` 每次新建实例）。
+- **TLS 取舍**：打印机是**每台自签名证书**，静态 CA 无法跨型号覆盖 →
+  `config.json` 开 `CONFIG_ESP_TLS_INSECURE=y` +
+  `CONFIG_ESP_TLS_SKIP_SERVER_CERT_VERIFY=y`（IDF 6.1 无 CA 时 esp-tls 默认
+  **直接报错** `ESP_ERR_MBEDTLS_SSL_SETUP_FAILED`，必须开这个开关才是
+  VERIFY_NONE）+ 跳过 CN 校验；会话由 LAN 访问码认证，与 HA 本地 Bambu
+  `tls_insecure` 的常见做法一致。仅影响"没配 CA"的 esp-tls 连接（本板只有
+  这一个），小智云端仍走 crt bundle 正常校验。
+- **配置录入**（屏上，无网页门户）：card 2 右下齿轮 → `printer_settings_page_`
+  覆盖层 = 3 行表单（IP 地址/序列号/访问码，行首标签 + 右侧值 label
+  `LV_LABEL_LONG_DOT` 省略超长 IP，访问码行显示 `******`）+ 底部
+  `保存/返回`（96×44，`BOTTOM_MID ±56 y=+2`）。点行进入编辑态：行列表隐藏，
+  上方 textarea（320×48，访问码开 password mode）+ `lv_keyboard`（340×176，
+  **y=134..310 必须在圆屏最宽弦带内**，340 宽在 y=310 半弦 178 刚好容纳）；
+  IP/访问码用 `LV_KEYBOARD_MODE_NUMBER`（数字+点大键盘），SN 用
+  `TEXT_LOWER`；**键盘 ✓ 键等效于"完成"**——LVGL 对 `LV_SYMBOL_OK` 只发
+  `LV_EVENT_READY`（键盘图标/关闭键发 `LV_EVENT_CANCEL`），默认处理器不会关
+  窗口，板级对 kb 注册 READY/CANCEL、对 ta 注册 READY（Enter 单行键只发给
+  textarea）→ `StopPrinterEditing()` 回表单行列表（`printer_focus_ < 0`
+  守卫防双发）；每击键 `VALUE_CHANGED` 同步到 pending 字符串；
+  `完成` 回到行列表（换字段 = 完成→点另一行），`保存` 校验
+  （IP=数字字母点横线≤64、SN=4-24 位字母数字、访问码=4-8 位数字，错误红字显示在
+  表单提示行并自动退出编辑态）→ `bambu_printer::SetConfig()` 写 NVS
+  ns=`bambu_printer`（key `host/serial/access_code`）→ 立即重连 + 关闭覆盖层。
+  编辑态（`printer_focus_ >= 0`）下所有滑动手势被吞，防止键盘上的右滑误关页面。
+- **生命周期**：`CustomBoard::SetNetworkEventCallback()` **包装**（不是覆盖）
+  Application 的回调 → `Connected` → `OnNetworkUp()`（建 3 个 esp_timer：
+  2s 后 `ConnectNow()`，错开小智协议首次 TLS 握手的堆峰值）；`Disconnected` /
+  `WifiConfigModeEnter` → `OnNetworkDown()`（销毁客户端，配网 SoftAP 期间保持
+  射频安静，与 BLE 扫描同样的理由）。esp-mqtt 自动重连 15s，失败 → `kOffline`。
+- **线程模型（关键）**：MQTT 事件跑在 esp-mqtt task，**绝不取
+  `s_life_mutex`**（`esp_mqtt_client_stop()` 会 join 该任务，若 handler 需要
+  同一把锁即死锁）；状态变更经 10ms 一次性 esp_timer **延迟到 esp_timer task**
+  才回调 UI（`OnPrinterStatus` 取 `DisplayLockGuard`）—— 这样 UI 任务在
+  `SetConfig` 里 stop/destroy 客户端时，没有任何在途 handler 会等 LVGL 锁。
+  双锁顺序恒为 `life → status`。
+- **第三屏 UI**（黑底页，样板同 card 1）：**进度环贴表盘最外圈**——arc 404px
+  （中心半径 195、外缘 202，距 R=206 黑边 4px），轨道深灰 `#333333`、进度
+  `#21A452`，主题画在指示末端的**蓝色圆点（KNOB part）全部样式置透明**
+  （bg_opa/border/outline/shadow）；环的**底部缺口环绕设置齿轮**：
+  `lv_arc_set_bg_angles(108°, 72°)`（<start 的 wrap 与默认 135/45 同机制），
+  两端落在 (146,391)/(266,391)，即齿轮命中框两侧各 ~29px——齿轮位置与
+  热区参数不变、最后创建（绘制/命中都在环之上）。环内信息自上而下：
+  **进度 %**（montserrat_40，恒绿 `#21A452`，y=96）→ **打印状态**
+  （`font_noto_sans_basic_20_4`，比主题 16px 大一号，y=170；在线一律绿、
+  仅 FAILED 红 `#FF4000`，未配置/连接中/离线灰）→ **打印机 IP**（灰
+  `#888`，y=206；未配置时此行显示引导文字）→ `剩余 h:mm`（灰 y=234）→
+  **喷嘴/热床双温**（y=296，行中心 x=146/266）。温度行**汉字换图标**：
+  MDI `printer-3d-nozzle`(U+F0E5B) + `waves-arrow-up`(U+F185B)——
+  BambuSphere 同款两个图标，未抄其字体文件（FNCL），而是用 `lv_font_conv`
+  从 Apache-2.0 的 MaterialDesign TTF 重新生成 `font_bambu_icons_20.c`
+  （板级目录，glob 编译，文件头带出处与许可）。状态 20px 中文字体
+  `font_noto_sans_basic_20_4` 是静态 flash 字体，与主题换字体无耦合
+  （xiaozhi.bin 因此 +124KB，分区余 24%）。中文（除图标外）一律继承
+  screen 字体，仅百分比/图标用静态字体。
+- **语音切屏**：MCP 工具 `self.screen.show_printer`
+  （`ShowPrinterPage()` → `CloseAnySettings()` + `ShowCard(2)`）。
+- **sdkconfig**：`sdkconfig_append` 新增 `CONFIG_LV_USE_KEYBOARD=y`（LVGL
+  keyboard 组件默认未编译）、上述两个 esp-tls 开关、
+  `CONFIG_MQTT_BUFFERS_ON_EXTERNAL_MEMORY=y` +
+  `CONFIG_MQTT_TASK_STACK_ON_EXTERNAL_MEMORY=y`（16KB 收包缓冲 + 8KB 任务栈
+  放 PSRAM，内部 SRAM 只剩 ~48KB，放内部撑不住）。
 
 
