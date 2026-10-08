@@ -272,3 +272,10 @@ Log:
 - 需求: 第一屏说"我要查看温湿度"自动跳转第二屏仪表盘
 - 方案: 云端 MCP 路径（协议/核心零改动）。板级 `CustomLcdDisplay` 增 public `ShowSensorPage()`——`DisplayLockGuard`（工具回调在主任务、非 LVGL 上下文，`ShowCard` 假定已持锁）+ 设置页开着先 `CloseSettings()`（`ShowCard` 对 `settings_open_` 是 no-op）+ `ShowCard(1)`；`CustomBoard::InitializeTools()`（构造函数调用，含 `#include "mcp_server.h"`）注册普通 `AddTool("self.screen.show_sensor", ...)`，description 写明查看温湿度时调用。工具回调经 `McpServer::DoToolCall → Application::Schedule` 在主任务执行，无需再 Schedule。触发依赖云端 LLM 从 tools/list 拉到该工具并决定调用
 - 验证: clang-format --dry-run 通过；`python scripts/build.py waveshare/esp32-s3-touch-lcd-1.46 --name esp32-s3-touch-lcd-1.46` 编译通过（xiaozhi.bin 0x2db6f0，分区余 27%）；COM7 烧录+65s 监视：`MCP: Add tool: self.screen.show_sensor`（板级工具先于核心工具注册）、MQTT 连上进 idle、无 crash、free sram 48KB、BLE 读数正常；待实测语音"我要查看温湿度"→ 跳第二屏（看 `show sensor page requested (MCP)` 日志）、设置页打开时语音指令（应先关设置页）、右滑返回
+
+### [2026-10-08] BLE 扫描改为仅第二屏激活（排查配网热点掉线）
+- 状态: 已完成（编译+烧录+硬件复测通过；配网一次成功）
+- 范围: main/boards/waveshare/esp32-s3-touch-lcd-1.46/{esp32-s3-touch-lcd-1.46.cc,README.md}、AGENTS.md
+- 需求: 换网络环境后手机连配网热点 Xiaozhi-2CC9 约 10 秒即断、配网页打不开；串口日志（两轮，`wifi_config_log.txt`）显示设备无崩溃、页面曾成功打开但链路在活跃使用时段反复 `Station left`（19:44:06~19:44:56 五次掉线后又稳定 4 分钟），组件日志丢弃 disassoc reason 无法定责；用户判断是 BLE 常驻扫描（`duration=forever`，当天新增 XL0801 绑定功能）与 SoftAP 2.4G 共存干扰 → 要求 BLE 改为只在第二屏才扫描
+- 方案: `RefreshScanState()` 门槛改为 `card_index_ == 1 && (settings_open_ || any_bound)`（原为开机有绑定即常扫）；`ShowCard()` 切卡后调用 `RefreshScanState()` 实现进第二屏开扫、回主屏停扫；开机默认 card 0 → NimBLE host 首次初始化推迟到首次进第二屏/设置页
+- 验证: 编译（xiaozhi.bin 0x2db700，分区余 27%）+clang-format+烧录 COM7 通过；第三轮日志（20:15~20:25）：开机日志**完全没有** BLE_INIT/NimBLE/ble_sensor（free sram 183KB vs 原 117KB，NimBLE 栈不再常驻）；20:16:54 手机入网→20:17:16 提交密码→CSA 切信道→保存→退出配网→STA 拿到 192.168.31.196→MQTT 连上进 idle，**全程 0 次 `Station left`**，配网一次成功（此前同环境下 10 秒即断）；配网期间 config AP 的 10s 扫描仍在跑但不再掉线，反证 BLE 共存是主因；待肉眼确认：滑到第二屏 BLE 恢复扫描出数、滑回主屏停扫

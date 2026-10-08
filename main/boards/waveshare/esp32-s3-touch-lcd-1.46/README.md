@@ -102,9 +102,11 @@ https://www.waveshare.net/shop/ESP32-S3-Touch-LCD-1.46B.htm
 - **绑定流程**："绑定" → 居中 `slot_panel_` 选 1-4 号位（按钮下"空/已绑"状态，
   `lv_font_montserrat_40` 数字）→ `ApplyBinding()` 写 NVS 并关闭设置页回第二屏。
   同一 MAC 只允许占一个圆（占新位时自动从其它位清除）。暂无解绑入口。
-- **扫描生命周期**（`RefreshScanState()`）：设置页打开 **或** 任一位已绑定 →
-  `ble_sensor::EnsureScanning()`；两者皆无 → `StopScanning()`（NimBLE host
-  常驻不销毁）。绑定后开机会自动恢复扫描并直接出数。
+- **扫描生命周期**（`RefreshScanState()`）：仅当 **card 1 可见** 且（设置页打开
+  **或** 任一位已绑定）→ `ble_sensor::EnsureScanning()`；否则（含开机默认的
+  card 0、AI 主屏、配网模式）→ `StopScanning()`（NimBLE host 常驻不销毁）。
+  动机：BLE 与 SoftAP 共享 2.4G 射频，开机常驻扫描会让配网热点 10 秒左右就
+  断连；进入第二屏自动恢复扫描出数，滑回主屏即停。
 - **广播解析**（`ble_sensor.cc`，尾部锚定，前缀字节忽略）：
   厂商数据 `0xFF` 尾部 = `[温度 u16 大端, 0.1°C][湿度 u8, %][MAC 6B]`，
   例如 `...01 20 45 ED 68 01 04 91 8C` → 28.8°C / 69% / `ED:68:01:04:91:8C`
@@ -117,7 +119,7 @@ https://www.waveshare.net/shop/ESP32-S3-Touch-LCD-1.46B.htm
   `CONFIG_BT_ENABLED=y`、`CONFIG_BT_NIMBLE_ENABLED=y`（`BT_NIMBLE_ROLE_OBSERVER`
   默认即 y）；本仓库 `main` 组件本就 `PRIV_REQUIRES bt`，BluFi 未启用，无冲突。
   NimBLE host + controller 只在 `EnsureScanning()` 首次调用时才
-  `nimble_port_init()`（即首次进设置页或已有绑定的开机）。
+  `nimble_port_init()`（即首次进设置页或首次滑到 card 1 且有绑定）。
 - **设置页打开期间**：左滑/竖滑被吞掉（防止误切卡片），**右滑 ≥60px 关闭设置页**，
   关闭主要仍靠底部"返回"按钮。
 

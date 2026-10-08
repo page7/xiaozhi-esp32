@@ -134,8 +134,10 @@ public:
             OnBleAdvertisement(mac, reading);
         });
         // Restore bindings; bound circles start out waiting for their first
-        // advertisement. Keep scanning while anything is bound so readings
-        // show up right after boot.
+        // advertisement. Scanning stays off on card 0 (the boot card): with
+        // BLE sharing the 2.4G radio it destabilised the Wi-Fi config
+        // hotspot, so RefreshScanState() only arms it once the sensor page
+        // becomes visible.
         for (int i = 0; i < kSensorCount; ++i) {
             bindings_[i] = ble_sensor::GetBinding(i);
             sensor_readings_[i].bound = !bindings_[i].empty();
@@ -370,9 +372,11 @@ private:
         }
     }
 
-    // Scanning is needed while the settings list is open (to discover
-    // devices) or while any slot is bound (to keep readings live); otherwise
-    // park the radio.
+    // BLE scanning only while the sensor dashboard is the visible card -
+    // the radio must stay quiet on the AI main screen and during Wi-Fi
+    // provisioning (coex with the SoftAP was destabilising the config
+    // hotspot). Within card 1 the old rule applies: scan while the settings
+    // list is open (discovery) or any slot is bound (live readings).
     void RefreshScanState() {
         bool any_bound = false;
         for (const auto& binding : bindings_) {
@@ -381,7 +385,7 @@ private:
                 break;
             }
         }
-        if (settings_open_ || any_bound) {
+        if (card_index_ == 1 && (settings_open_ || any_bound)) {
             ble_sensor::EnsureScanning();
         } else {
             ble_sensor::StopScanning();
@@ -783,6 +787,8 @@ private:
         } else {
             lv_obj_remove_flag(sensor_page_, LV_OBJ_FLAG_HIDDEN);
         }
+        // Arm/disarm the BLE scan with the visible card.
+        RefreshScanState();
     }
 
     void NextCard() { ShowCard(card_index_ + 1); }
