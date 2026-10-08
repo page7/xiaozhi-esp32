@@ -44,6 +44,12 @@ https://www.waveshare.net/shop/ESP32-S3-Touch-LCD-1.46B.htm
   `emoji_box_` 的显隐状态管理。
 - **方向**：横向左滑 → 下一张卡，右滑 → 返回；纵向暂不处理但会打日志。
   阈值 `kSwipeThresholdPx = 60`（约屏宽 15%）。
+- **语音切屏（MCP）**：`CustomBoard::InitializeTools()` 注册
+  `self.screen.show_sensor`（description 指明查看温湿度时调用）。云端 LLM 下发
+  `tools/call` → `McpServer::DoToolCall` 经 `Application::Schedule` 在主任务执行
+  → public `ShowSensorPage()`：`DisplayLockGuard` + 设置页开着先 `CloseSettings()`
+  （`ShowCard` 对 `settings_open_` 是 no-op）+ `ShowCard(1)`。命中依赖后端从
+  tools/list 拉到工具并决定调用；触发日志 `show sensor page requested (MCP)`。
 - **布局（圆形屏）**：可见区是 412×412 的内切圆（R=206），2×2 网格的对角触点
   `√2·(d+gap)/2 + d/2` 必须小于 R，否则四角被圆形黑边裁掉——
   `kSensorGridMargin = 50` → `d = (412-100-12)/2 = 150`，触点 190px，内缩 16px。

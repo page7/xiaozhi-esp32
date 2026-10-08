@@ -25,6 +25,7 @@
 #include "i2c_device.h"
 #include "lcd_display.h"
 #include "lvgl_theme.h"
+#include "mcp_server.h"
 #include "touch_spd2010.h"
 
 #define TAG "waveshare_lcd_1_46"
@@ -160,6 +161,21 @@ public:
         touch_indev_ = indev;
         lv_indev_add_event_cb(indev, SwipeEventCb, LV_EVENT_PRESSED, this);
         lv_indev_add_event_cb(indev, SwipeEventCb, LV_EVENT_RELEASED, this);
+    }
+
+    // Voice/MCP entry point (see CustomBoard::InitializeTools): jump straight
+    // to the sensor dashboard. Runs on the main task, NOT inside an LVGL
+    // callback, so take the lock here - ShowCard() assumes it is already held.
+    void ShowSensorPage() {
+        DisplayLockGuard lock(this);
+        ESP_LOGI(TAG, "show sensor page requested (MCP)");
+        // ShowCard() silently no-ops while the settings overlay is open
+        // (guard in ShowCard), so close it first - the voice intent wins.
+        if (settings_open_) {
+            CloseSettings();
+        }
+        // card 0 = AI main screen, card 1 = sensor dashboard (kCardCount = 2).
+        ShowCard(1);
     }
 
 private:
@@ -998,6 +1014,22 @@ private:
             this);
     }
 
+    // Registered from the constructor; the callback runs on the main task
+    // (McpServer::DoToolCall schedules it), not a network task. The backend
+    // LLM sees this tool via tools/list and calls it when the user asks for
+    // the sensor readings, e.g. "我要查看温湿度".
+    void InitializeTools() {
+        auto& mcp_server = McpServer::GetInstance();
+        mcp_server.AddTool("self.screen.show_sensor",
+                           "Switch the display to the temperature/humidity sensor dashboard. "
+                           "Call when the user wants to view temperature, humidity or sensor "
+                           "readings (e.g. \"我要查看温湿度\").",
+                           PropertyList(), [this](const PropertyList& properties) -> ReturnValue {
+                               display_->ShowSensorPage();
+                               return true;
+                           });
+    }
+
 public:
     CustomBoard() {
         InitializeI2c();
@@ -1008,6 +1040,7 @@ public:
         // to lv_display_get_default) and after I2C is up.
         InitializeTouch();
         InitializeButtons();
+        InitializeTools();
         GetBacklight()->RestoreBrightness();
     }
 

@@ -265,3 +265,10 @@ Log:
 - 需求: 1) 返回按钮关不掉设置页；2) 列表里所有设备都叫 XL0801，换成广播温湿度以区分
 - 方案: 1) 返回按钮 96x40/-14（358..398）→ `120x56` + `BOTTOM_MID y=+4`（360..416 × 146..266，与齿轮同款圆屏边缘落点问题）；另加兜底：设置页打开时横向右滑 ≥60px 关闭（左/竖滑仍吞）。2) `FoundDevice` 增 `reading_label`，行首 "XL0801" 换成 `%.1f°C %.0f%%` 实时读数；`UpdateDeviceReading()` 每包 strcmp 节流后才 `lv_label_set_text`；行仅设置页打开时创建、关闭后仍静默刷新
 - 验证: 编译（xiaozhi.bin 0x2db4d0，分区余 27%）+clang-format 通过；COM7 烧录+5min 监视：开机即恢复扫描（slot1 绑定存在 → 1.3s `scan started` → 4s `found ED:68:01:03:B5:AC: 28.5C 36%`）、无 crash、free sram 稳定 48KB；该轮无触摸操作，返回按钮/行读数需实测
+
+### [2026-10-08] 语音切屏：MCP 工具 self.screen.show_sensor
+- 状态: 已完成（编译+clang-format+烧录通过，工具注册/启动已日志确认；语音触发待实测）
+- 范围: main/boards/waveshare/esp32-s3-touch-lcd-1.46/esp32-s3-touch-lcd-1.46.cc、AGENTS.md
+- 需求: 第一屏说"我要查看温湿度"自动跳转第二屏仪表盘
+- 方案: 云端 MCP 路径（协议/核心零改动）。板级 `CustomLcdDisplay` 增 public `ShowSensorPage()`——`DisplayLockGuard`（工具回调在主任务、非 LVGL 上下文，`ShowCard` 假定已持锁）+ 设置页开着先 `CloseSettings()`（`ShowCard` 对 `settings_open_` 是 no-op）+ `ShowCard(1)`；`CustomBoard::InitializeTools()`（构造函数调用，含 `#include "mcp_server.h"`）注册普通 `AddTool("self.screen.show_sensor", ...)`，description 写明查看温湿度时调用。工具回调经 `McpServer::DoToolCall → Application::Schedule` 在主任务执行，无需再 Schedule。触发依赖云端 LLM 从 tools/list 拉到该工具并决定调用
+- 验证: clang-format --dry-run 通过；`python scripts/build.py waveshare/esp32-s3-touch-lcd-1.46 --name esp32-s3-touch-lcd-1.46` 编译通过（xiaozhi.bin 0x2db6f0，分区余 27%）；COM7 烧录+65s 监视：`MCP: Add tool: self.screen.show_sensor`（板级工具先于核心工具注册）、MQTT 连上进 idle、无 crash、free sram 48KB、BLE 读数正常；待实测语音"我要查看温湿度"→ 跳第二屏（看 `show sensor page requested (MCP)` 日志）、设置页打开时语音指令（应先关设置页）、右滑返回
