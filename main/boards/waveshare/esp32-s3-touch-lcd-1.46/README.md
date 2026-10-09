@@ -61,7 +61,7 @@ https://www.waveshare.net/shop/ESP32-S3-Touch-LCD-1.46B.htm
   `space_left/top`），不清零会把四圆整体往右下推 16px（上间隙32、下间隙0，
   表现为"四圆偏下、贴底边"）。
 - **读数渲染**：湿度大字 = `lv_font_montserrat_40`（`config.json` 的
-  `sdkconfig_append` 开 `CONFIG_LV_FONT_MONTSERRAT_40/12=y`，build.py 每次全量重生成
+  `sdkconfig_append` 开 `CONFIG_LV_FONT_MONTSERRAT_40/30/12=y`，build.py 每次全量重生成
   sdkconfig）。**伪加粗**：4 层同文本按 (0,0)/(1,0)/(0,1)/(1,1) 叠放——LVGL 描边
   `text_outline_stroke` 只在 `#if LV_USE_FREETYPE && LV_USE_VECTOR_GRAPHIC` 分支生效
   （位图字体无效，本工程也未开 FREETYPE），必须放进**固定尺寸** 130×48 容器：
@@ -97,9 +97,13 @@ https://www.waveshare.net/shop/ESP32-S3-Touch-LCD-1.46B.htm
   `lv_label_set_text`，避免广播频率下的重复分配）+ montserrat_12 的 MAC +
   "绑定"按钮；空列表提示"未找到 XL0801 设备"（首个设备出现时删除）。
   行仅在设置页打开期间创建，但已存在行在关闭后仍随广播静默刷新。
-- **返回**：按钮 `120x56`、`BOTTOM_MID y=+4`（命中框 360..416 × 146..266）——
-  与齿轮同样的问题：圆屏边缘手指落点稳定在 y=406-408，原 96x40/-14 按钮
-  （358..398）全部 miss；另外设置页打开时**横向右滑 ≥60px 也关闭**
+- **返回**：按钮 `120x56`、`BOTTOM_MID y=-28`（命中框 328..384 × 146..266）——
+  演变：最早 96x40/-14 贴边全 miss → 加大到 120x56/+4 贴屏幕最下沿 →
+  2026-10-08 反馈**太靠下、圆弧区不好点**，整体上移 32px；y≤384 时整个
+  按钮落在可见弦内（该处半弦 104）→ 同日再反馈"**只有按到文字才生效**"，
+  加 `lv_obj_set_ext_click_area(16)`：命中框 = coords + ext（lv_obj_pos.c），
+  纯命中扩张、视觉零变化（与齿轮当年 pad 扩热区同一思路，LVGL 自家
+  arc/slider 同款手法）。另外设置页打开时**横向右滑 ≥60px 也关闭**
   （`HandleSwipe` 里 `settings_open_` 分支），左滑/竖滑仍被吞。
 - **绑定流程**："绑定" → 居中 `slot_panel_` 选 1-4 号位（按钮下"空/已绑"状态，
   `lv_font_montserrat_40` 数字）→ `ApplyBinding()` 写 NVS 并关闭设置页回第二屏。
@@ -163,7 +167,10 @@ https://www.waveshare.net/shop/ESP32-S3-Touch-LCD-1.46B.htm
 - **配置录入**（屏上，无网页门户）：card 2 右下齿轮 → `printer_settings_page_`
   覆盖层 = 3 行表单（IP 地址/序列号/访问码，行首标签 + 右侧值 label
   `LV_LABEL_LONG_DOT` 省略超长 IP，访问码行显示 `******`）+ 底部
-  `保存/返回`（96×44，`BOTTOM_MID ±56 y=+2`）。点行进入编辑态：行列表隐藏，
+  `保存/返回`（96×44，`BOTTOM_MID ±56 y=-28`，底边 384——与第二屏返回
+  按钮同一轮"圆屏上移"调整；随后补 `lv_obj_set_ext_click_area(8)` 扩命中
+  框——8 是不与邻居重叠的上限：save 94..206 vs back 206..318，back 为
+  后建兄弟会赢任何重叠区）。点行进入编辑态：行列表隐藏，
   上方 textarea（320×48，访问码开 password mode）+ `lv_keyboard`（340×176，
   **y=134..310 必须在圆屏最宽弦带内**，340 宽在 y=310 半弦 178 刚好容纳）；
   IP/访问码用 `LV_KEYBOARD_MODE_NUMBER`（数字+点大键盘），SN 用
@@ -196,21 +203,39 @@ https://www.waveshare.net/shop/ESP32-S3-Touch-LCD-1.46B.htm
   两端落在 (146,391)/(266,391)，即齿轮命中框两侧各 ~29px——齿轮位置与
   热区参数不变、最后创建（绘制/命中都在环之上）。环内信息自上而下：
   **进度 %**（montserrat_40，恒绿 `#21A452`，y=96）→ **打印状态**
-  （`font_noto_sans_basic_20_4`，比主题 16px 大一号，y=170；在线一律绿、
-  仅 FAILED 红 `#FF4000`，未配置/连接中/离线灰）→ **打印机 IP**（灰
-  `#888`，y=206；未配置时此行显示引导文字）→ `剩余 h:mm`（灰 y=234）→
-  **喷嘴/热床双温**（y=296，行中心 x=146/266）。温度行**汉字换图标**：
-  MDI `printer-3d-nozzle`(U+F0E5B) + `waves-arrow-up`(U+F185B)——
-  BambuSphere 同款两个图标，未抄其字体文件（FNCL），而是用 `lv_font_conv`
-  从 Apache-2.0 的 MaterialDesign TTF 重新生成 `font_bambu_icons_20.c`
-  （板级目录，glob 编译，文件头带出处与许可）。状态 20px 中文字体
-  `font_noto_sans_basic_20_4` 是静态 flash 字体，与主题换字体无耦合
-  （xiaozhi.bin 因此 +124KB，分区余 24%）。中文（除图标外）一律继承
-  screen 字体，仅百分比/图标用静态字体。
+  （`lv_font_montserrat_30`，30px——应"字体增大"由 20px 提上来，y=166；在线一律绿、
+  仅 FAILED 红 `#FF4000`，setup/connecting/offline 灰）→ **打印机 IP**（灰
+  `#888`，y=206；未配置时此行显示引导文字）→ **剩余时间行**（灰 y=234，
+  见下）→ **喷嘴/热床双温**（y=296，行中心 x=146/266）。
+  - **状态行 = 英文小写，词表同 BambuSphere**（`lifecycle_label`/ui_status）：
+    `setup`(未配置) / `connecting` / `offline` / `connected`(刚连上) /
+    `printing` / `preparing` / `paused` / `done` / `failed` / `idle`，
+    未知 gcode_state 原样显示。**该行只能放英文**：现用
+    `lv_font_montserrat_30` 是纯 ASCII 字体，中文会整字不画；改英文前用的
+    静态 `font_noto_sans_basic_20_4` 则是 ASCII 完整、**CJK 仅 531 汉字
+    残缺子集**，LVGL 对缺字形静默跳过——"打印机离线"只剩"机"（2026-10-08
+    实机复现的根因）；代码处有防回归注释。16px 标签不受影响：它们继承
+    主题字体，assets 加载时被 `LvglStrategy` 换成全字库 cbin。
+  - **剩余时间 = 时钟图标 + 数值**（同 BambuSphere 的 remaining 行结构：
+    居中 flex 行 = MDI `clock-time-four-outline`(U+F144E，即它的
+    `kMdiClock`) + 数值），格式同它的 `remaining_text()`：
+    `Done`（FINISH）/ `--m`（无数据/未连接）/ `1h 35m` / `45m`。
+  - **温度行汉字换图标**：MDI `printer-3d-nozzle`(U+F0E5B) +
+    `waves-arrow-up`(U+F185B)——BambuSphere 同款。未抄其字体文件（FNCL），
+    而是用 `lv_font_conv` 从 Apache-2.0 的 MaterialDesign TTF 重新生成
+    **三字形** `font_bambu_icons_20.c`（板级目录，glob 编译，文件头带
+    出处与许可）。
+  - 状态字体演进：16 继承 → 20px 静态 `font_noto_sans_basic_20_4`（+124KB，
+    CJK 残缺坑见上）→ **30px `lv_font_montserrat_30`**（应"字体增大"，
+    `config.json` 新增 `CONFIG_LV_FONT_MONTSERRAT_30=y`，纯 ASCII 约 +15KB；
+    noto20 不再被引用，链接器整体回收，bin 净减 ~80KB：0x2fd880→0x2ea150，
+    分区余 24%→26%）。静态 flash 字体，与主题换字体无耦合。中文（引导语
+    等）一律继承 screen 字体，仅百分比/图标/状态用静态字体。
 - **语音切屏**：MCP 工具 `self.screen.show_printer`
   （`ShowPrinterPage()` → `CloseAnySettings()` + `ShowCard(2)`）。
 - **sdkconfig**：`sdkconfig_append` 新增 `CONFIG_LV_USE_KEYBOARD=y`（LVGL
-  keyboard 组件默认未编译）、上述两个 esp-tls 开关、
+  keyboard 组件默认未编译）、`CONFIG_LV_FONT_MONTSERRAT_30=y`（状态行 30px）、
+  上述两个 esp-tls 开关、
   `CONFIG_MQTT_BUFFERS_ON_EXTERNAL_MEMORY=y` +
   `CONFIG_MQTT_TASK_STACK_ON_EXTERNAL_MEMORY=y`（16KB 收包缓冲 + 8KB 任务栈
   放 PSRAM，内部 SRAM 只剩 ~48KB，放内部撑不住）。

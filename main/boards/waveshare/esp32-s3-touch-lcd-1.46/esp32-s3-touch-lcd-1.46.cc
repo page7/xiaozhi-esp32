@@ -66,12 +66,13 @@ constexpr float kHumidityRed = 30.0f;
 
 // Settings gear at the bottom centre of card 1. font_material_symbols_30_4
 // is already linked through lcd_display.cc; the Montserrat sizes come from
-// config.json sdkconfig_append (CONFIG_LV_FONT_MONTSERRAT_40/12=y).
+// config.json sdkconfig_append (CONFIG_LV_FONT_MONTSERRAT_40/30/12=y).
 LV_FONT_DECLARE(font_material_symbols_30_4);
-// Printer status line is one step up from the theme's 16px. Static
-// flash-resident font - safe against the runtime theme font swap (the
-// failure mode documented in BuildSensorPage).
-LV_FONT_DECLARE(font_noto_sans_basic_20_4);
+// Printer status line: 30px Montserrat, enabled via
+// CONFIG_LV_FONT_MONTSERRAT_30 (config.json sdkconfig_append) - declared
+// by lv_font.h, no LV_FONT_DECLARE needed. Static flash font, safe against
+// the runtime theme font swap (the failure mode in BuildSensorPage).
+
 // MDI printer-3d-nozzle / waves-arrow-up - the nozzle/bed icons BambuSphere
 // shows (font_bambu_icons_20.c in this directory, generated with
 // lv_font_conv from the Apache-2.0 MaterialDesign font).
@@ -96,10 +97,12 @@ constexpr int kPrinterArcGapEnd = 72;
 // line, deep grey for the ring track.
 constexpr uint32_t kPrinterGreen = 0x21A452;
 constexpr uint32_t kPrinterTrackGrey = 0x333333;
-// MDI glyphs used by BambuSphere for the temp chips (see
-// font_bambu_icons_20.c): printer-3d-nozzle and waves-arrow-up.
+// MDI glyphs used by BambuSphere (see font_bambu_icons_20.c):
+// printer-3d-nozzle / waves-arrow-up for the temp chips, and its
+// kMdiClock (clock-time-four-outline) for the remaining-time row.
 constexpr const char* kMdiNozzleIcon = "\xF3\xB0\xB9\x9B";
 constexpr const char* kMdiBedIcon = "\xF3\xB1\xA1\x9B";
+constexpr const char* kMdiClockIcon = "\xF3\xB1\x91\x8E";
 
 // Printer settings overlay (card 2 gear): the local MQTT connection form.
 // Three rows (IP / serial / access code) are stacked on the upper band; the
@@ -456,16 +459,19 @@ private:
         lv_label_set_text(printer_progress_label_, "--");
         lv_obj_align(printer_progress_label_, LV_ALIGN_TOP_MID, 0, 96);
 
-        // Status line - middle of the ring, one size up (20px noto), green
-        // in every live state (red kept only for a concrete print failure).
-        // Static font, so nothing to coordinate with the theme swap; the
-        // 20px noto is only referenced here, the linker pulls the glyph
-        // blob in on demand.
+        // Status line - middle of the ring, 30px (montserrat, bumped from
+        // 20px on request), green in every live state (red kept only for a
+        // concrete print failure). Static flash font, so nothing to
+        // coordinate with the theme swap. ENGLISH ONLY (see
+        // PrinterStateText): the earlier 20px noto proved the danger - its
+        // CJK subset held just 531 hanzi and LVGL silently skips missing
+        // glyphs, rendering "打印机离线" as "机"; montserrat is ASCII-only,
+        // so Chinese on this label would drop out entirely instead.
         printer_state_label_ = lv_label_create(printer_page_);
-        lv_obj_set_style_text_font(printer_state_label_, &font_noto_sans_basic_20_4, 0);
+        lv_obj_set_style_text_font(printer_state_label_, &lv_font_montserrat_30, 0);
         lv_obj_set_style_text_color(printer_state_label_, lv_color_hex(0x888888), 0);
         lv_label_set_text(printer_state_label_, "--");
-        lv_obj_align(printer_state_label_, LV_ALIGN_TOP_MID, 0, 170);
+        lv_obj_align(printer_state_label_, LV_ALIGN_TOP_MID, 0, 166);
 
         // Printer IP right under the status (grey); setup hint text shares
         // this label while unconfigured. Inherits the screen font.
@@ -474,10 +480,31 @@ private:
         lv_label_set_text(printer_hint_label_, "");
         lv_obj_align(printer_hint_label_, LV_ALIGN_TOP_MID, 0, 206);
 
-        printer_remain_label_ = lv_label_create(printer_page_);
+        // Remaining time as a BambuSphere-style row: [MDI clock icon] +
+        // value ("Done" / "1h 35m" / "45m" / "--m"). Same transparent
+        // flex-row pattern as the temp chips below.
+        lv_obj_t* remain_row = lv_obj_create(printer_page_);
+        lv_obj_set_size(remain_row, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
+        lv_obj_set_style_bg_opa(remain_row, LV_OPA_TRANSP, 0);
+        lv_obj_set_style_border_width(remain_row, 0, 0);
+        lv_obj_set_style_radius(remain_row, 0, 0);
+        lv_obj_set_style_pad_all(remain_row, 0, 0);
+        lv_obj_set_style_pad_column(remain_row, 6, 0);
+        lv_obj_set_scrollbar_mode(remain_row, LV_SCROLLBAR_MODE_OFF);
+        lv_obj_remove_flag(remain_row, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_set_flex_flow(remain_row, LV_FLEX_FLOW_ROW);
+        lv_obj_set_flex_align(remain_row, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER,
+                              LV_FLEX_ALIGN_CENTER);
+
+        lv_obj_t* remain_icon = lv_label_create(remain_row);
+        lv_obj_set_style_text_font(remain_icon, &font_bambu_icons_20, 0);
+        lv_obj_set_style_text_color(remain_icon, lv_color_hex(0x999999), 0);
+        lv_label_set_text(remain_icon, kMdiClockIcon);
+
+        printer_remain_label_ = lv_label_create(remain_row);
         lv_obj_set_style_text_color(printer_remain_label_, lv_color_hex(0x999999), 0);
-        lv_label_set_text(printer_remain_label_, "");
-        lv_obj_align(printer_remain_label_, LV_ALIGN_TOP_MID, 0, 234);
+        lv_label_set_text(printer_remain_label_, "--m");
+        lv_obj_align(remain_row, LV_ALIGN_TOP_MID, 0, 234);
 
         // Nozzle / bed chips low in the ring: MDI icon (BambuSphere's pair)
         // + value in a small transparent flex row. Row centres (x=146/266,
@@ -525,33 +552,41 @@ private:
         lv_obj_add_event_cb(settings_icon, PrinterSettingsIconCb, LV_EVENT_CLICKED, this);
     }
 
+    // Display wording follows BambuSphere's lifecycle_label()/ui_status
+    // vocabulary (all lowercase): printing / preparing / paused / done /
+    // failed / idle / offline ... ENGLISH ONLY by design - this label uses
+    // lv_font_montserrat_30, an ASCII-only bitmap font: any Chinese here
+    // would silently drop. (The earlier 20px noto variant had full ASCII
+    // but only a 531-hanzi CJK subset - that is what turned "打印机离线"
+    // into a lone "机".) The 16px labels are fine - they inherit the theme
+    // font, which the assets loader swaps to the full cbin glyph font.
     static const char* PrinterStateText(const char* state) {
         if (state[0] == '\0') {
-            return "已连接";  // session up, first report not parsed yet
+            return "connected";  // session up, first report not parsed yet
         }
         if (strcmp(state, "RUNNING") == 0) {
-            return "打印中";
+            return "printing";
         }
         if (strcmp(state, "PREPARE") == 0 || strcmp(state, "INIT") == 0 ||
             strcmp(state, "SLICING") == 0) {
-            return "准备中";
+            return "preparing";
         }
         if (strcmp(state, "PAUSE") == 0 || strcmp(state, "PAUSED") == 0) {
-            return "已暂停";
+            return "paused";
         }
         if (strcmp(state, "FINISH") == 0) {
-            return "已完成";
+            return "done";
         }
         if (strcmp(state, "FAILED") == 0) {
-            return "打印错误";
+            return "failed";
         }
         if (strcmp(state, "IDLE") == 0) {
-            return "空闲";
+            return "idle";
         }
         if (strcmp(state, "OFFLINE") == 0) {
-            return "打印机离线";
+            return "offline";
         }
-        return state;  // unknown raw state, show the English original
+        return state;  // unknown raw state, show the gcode_state as-is
     }
 
     // The status line is the brand green in every live state (design spec);
@@ -561,6 +596,29 @@ private:
             return lv_color_hex(0xFF4000);  // red
         }
         return lv_color_hex(kPrinterGreen);
+    }
+
+    // BambuSphere's remaining_text(): "Done" once the job finished, "--m"
+    // with no data / while not connected, otherwise "1h 35m" / "45m".
+    // Static buffer - RefreshPrinterUI is the only caller and it always
+    // runs under the LVGL lock, so the value is consumed before the next
+    // call.
+    static const char* PrinterRemainingText(const bambu_printer::Status& status) {
+        static char buf[24];
+        const bool online = status.conn == bambu_printer::Conn::kOnline;
+        if (online && strcmp(status.state, "FINISH") == 0) {
+            return "Done";
+        }
+        if (!online || status.remaining_minutes <= 0) {
+            return "--m";
+        }
+        if (status.remaining_minutes >= 60) {
+            snprintf(buf, sizeof(buf), "%dh %02dm", status.remaining_minutes / 60,
+                     status.remaining_minutes % 60);
+        } else {
+            snprintf(buf, sizeof(buf), "%dm", status.remaining_minutes);
+        }
+        return buf;
     }
 
     // Single render path for the printer card. Called from SetupUI with the
@@ -575,15 +633,16 @@ private:
         const char* hint = "";
         switch (status.conn) {
             case bambu_printer::Conn::kNotConfigured:
-                state_text = "未配置";
+                // BambuSphere's word for "waiting for credentials" is "setup".
+                state_text = "setup";
                 hint = "请点右下角设置填写打印机信息";
                 break;
             case bambu_printer::Conn::kConnecting:
-                state_text = "连接中";
+                state_text = "connecting";
                 hint = printer_host_.c_str();
                 break;
             case bambu_printer::Conn::kOffline:
-                state_text = "打印机离线";
+                state_text = "offline";
                 hint = printer_host_.c_str();
                 break;
             case bambu_printer::Conn::kOnline:
@@ -609,13 +668,7 @@ private:
         lv_obj_set_style_arc_color(printer_arc_, online ? color : lv_color_hex(0x555555),
                                    LV_PART_INDICATOR);
 
-        if (online && status.remaining_minutes > 0) {
-            snprintf(buf, sizeof(buf), "剩余 %d:%02d", status.remaining_minutes / 60,
-                     status.remaining_minutes % 60);
-        } else {
-            buf[0] = '\0';
-        }
-        lv_label_set_text(printer_remain_label_, buf);
+        lv_label_set_text(printer_remain_label_, PrinterRemainingText(status));
 
         if (online && status.nozzle_temp >= 0.0f) {
             snprintf(buf, sizeof(buf), "%.0f°C", status.nozzle_temp);
@@ -850,12 +903,20 @@ private:
 
         // Back to the dashboard (also reachable while the slot picker is
         // open - the picker only covers the middle band of the round screen).
-        // Hit area: like the gear, taps land on the visible bottom arc
-        // (y=406-408, below the plain 358..398 box) - grow the button down
-        // to the screen edge so the whole lower band closes the page.
+        // Raised off the very bottom edge (y=+4 -> -28, box 328..384): on
+        // the round panel the outermost ~25px is a thin arc where presses
+        // are hard to land (2026-10-08 feedback), and at y<=384 the whole
+        // 120x56 box sits inside the visible chord (half-chord 104 there).
+        // +16 ext_click_area: the button still read "hard to trigger -
+        // only the text works" after the move, so widen the click box past
+        // the drawn box too (click area = coords + ext, lv_obj_pos.c; purely
+        // hit-test, nothing visual changes). Same remedy the card gears got
+        // with their pad expansion. Isolated button - no neighbour zone to
+        // collide with.
         lv_obj_t* back_btn = lv_button_create(settings_page_);
         lv_obj_set_size(back_btn, 120, 56);
-        lv_obj_align(back_btn, LV_ALIGN_BOTTOM_MID, 0, 4);
+        lv_obj_align(back_btn, LV_ALIGN_BOTTOM_MID, 0, -28);
+        lv_obj_set_ext_click_area(back_btn, 16);
         lv_obj_set_style_bg_color(back_btn, lv_color_hex(0x333333), 0);
         lv_obj_t* back_label = lv_label_create(back_btn);
         lv_label_set_text(back_label, "返回");
@@ -1030,12 +1091,20 @@ private:
         lv_obj_add_event_cb(printer_ta_, PrinterKbReadyCb, LV_EVENT_READY, this);
         lv_obj_add_flag(printer_kb_, LV_OBJ_FLAG_HIDDEN);
 
-        // Bottom band (proven hit zone on this round panel): save/back while
-        // browsing rows; "done" replaces save while editing. The two slots
-        // never show at once.
+        // Bottom row: save/back while browsing rows; "done" replaces save
+        // while editing (the two slots never show at once). Raised off the
+        // very bottom edge (y=+2 -> -28, boxes 340..384) for the same round-
+        // panel reason as the sensor settings' back button: the outer arc
+        // band is hard to press. At y<=384 the chord (x=102..310) covers all
+        // three buttons; the keyboard above ends at y=310, so no overlap.
+        // ext_click_area=8 widens only the hit box (click area = coords +
+        // ext); 8 is the max that keeps save (94..206) from bleeding into
+        // back (206..318) - back is the later sibling and would win any
+        // overlap, stealing save's right edge.
         printer_save_btn_ = lv_button_create(printer_settings_page_);
         lv_obj_set_size(printer_save_btn_, 96, 44);
-        lv_obj_align(printer_save_btn_, LV_ALIGN_BOTTOM_MID, -56, 2);
+        lv_obj_align(printer_save_btn_, LV_ALIGN_BOTTOM_MID, -56, -28);
+        lv_obj_set_ext_click_area(printer_save_btn_, 8);
         lv_obj_set_style_bg_color(printer_save_btn_, lv_color_hex(0x2F6BFF), 0);
         lv_obj_t* save_label = lv_label_create(printer_save_btn_);
         lv_label_set_text(save_label, "保存");
@@ -1044,7 +1113,8 @@ private:
 
         printer_done_btn_ = lv_button_create(printer_settings_page_);
         lv_obj_set_size(printer_done_btn_, 96, 44);
-        lv_obj_align(printer_done_btn_, LV_ALIGN_BOTTOM_MID, -56, 2);
+        lv_obj_align(printer_done_btn_, LV_ALIGN_BOTTOM_MID, -56, -28);
+        lv_obj_set_ext_click_area(printer_done_btn_, 8);
         lv_obj_set_style_bg_color(printer_done_btn_, lv_color_hex(0x2F6BFF), 0);
         lv_obj_t* done_label = lv_label_create(printer_done_btn_);
         lv_label_set_text(done_label, "完成");
@@ -1054,7 +1124,8 @@ private:
 
         lv_obj_t* back_btn = lv_button_create(printer_settings_page_);
         lv_obj_set_size(back_btn, 96, 44);
-        lv_obj_align(back_btn, LV_ALIGN_BOTTOM_MID, 56, 2);
+        lv_obj_align(back_btn, LV_ALIGN_BOTTOM_MID, 56, -28);
+        lv_obj_set_ext_click_area(back_btn, 8);
         lv_obj_set_style_bg_color(back_btn, lv_color_hex(0x333333), 0);
         lv_obj_t* back_label = lv_label_create(back_btn);
         lv_label_set_text(back_label, "返回");

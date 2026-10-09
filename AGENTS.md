@@ -293,3 +293,26 @@ Log:
 - 需求: 进度条移到表盘最外圈、去掉蓝色圆点、轨道深灰、进度绿 `#21A452`；环内信息自上而下=进度%(绿)+打印状态(绿、字号大一号)+IP(灰、状态下)；喷嘴/热床温度移到靠下、汉字换成 BambuSphere 的图标；设置按钮位置不变、进度条从设置按钮两侧开始和结束
 - 方案: arc 404px（中心半径195/外缘202，贴 R=206 黑边），`lv_arc_set_bg_angles(108°,72°)` 底部缺口环绕齿轮（两端 (146,391)/(266,391) = 齿轮命中框两侧 ~29px；wrap 语义同默认 135/45）；主题蓝点 = arc 的 LV_PART_KNOB，bg_opa/border/outline/shadow 全置透明去掉；状态字换 `font_noto_sans_basic_20_4`（16→20 大一号，静态 flash 字体），在线状态一律 `#21A452` 仅 FAILED 保留红、未配置/连接中/离线灰；温度行 = 图标+数值 flex 行，图标为 MDI `printer-3d-nozzle`(U+F0E5B)/`waves-arrow-up`(U+F185B)（BambuSphere `kMdiNozzle/kMdiBed` 同款，经 fonttools 确认 codepoint→glyph 名），**未抄其 FNCL 字体文件**，用本机 node+lv_font_conv 从 Apache-2.0 MaterialDesign TTF（@mdi/font 7.4.47 下载）生成 `font_bambu_icons_20.c`（板级目录 glob 编译，头注释带出处许可）；温度值去掉"喷嘴/热床"前缀
 - 验证: 编译通过（xiaozhi.bin 0x2fd700，+124KB 主要为20px中文字体，分区余 24%）；clang-format --dry-run 全部通过（生成的字体文件 -i 后）；COM7 烧录 + 355s 监视：`connecting to printer mqtt 192.168.31.172 (serial=0309AA452001874)`（NVS 配置持久化）→ `mqtt connected` → `subscribed` → `gcode_state=FINISH`；用户实测滑动 card0→1→2 与右滑返回、BLE 扫描随卡片启停正常、无 crash；free sram 稳定 115KB（card2 双 MQTT）/49KB（card1 BLE 扫描）；**待目视**：环贴边、缺口包住齿轮、无蓝点、进度/状态绿、20px 状态字、两个 MDI 图标正常显示、双温靠下
+
+### [2026-10-08] 第三屏状态行英文化 + 剩余时间改时钟图标
+- 状态: 进行中（编译+clang-format+烧录+258s 监视通过，待目视确认英文状态词/时钟图标/时间格式）
+- 范围: main/boards/waveshare/esp32-s3-touch-lcd-1.46/{esp32-s3-touch-lcd-1.46.cc,font_bambu_icons_20.c,README.md}、AGENTS.md
+- 需求: 未连接时状态只显示一个"机"字（bug）→ 查明根因后用户选择"仅状态行改英文"；英文词表要求对齐 BambuSphere；剩余时间去掉"剩余"字样，改成同 BambuSphere 的时间图标行
+- 根因（只读排查确证）: 状态行专用的静态 `font_noto_sans_basic_20_4` 对 ASCII 0x20-0x7E 是完整 dense 覆盖，但 **CJK 仅 531 汉字的 SPARSE 子集**（解析 cmap 逐字核对："打印机离线"只有`机`有字形→LVGL 静默跳过其余四字，屏上只剩"机"；"未配置"→"配"、"打印中"→"中"、"空闲"→全无）。16px 标签正常是因为它们继承主题字体、assets 加载时被 `LvglStrategy` 换成全字库 cbin——上一轮把状态字改为显式静态 20px 后脱离了 cbin 换字路径
+- 方案: **状态行全英文小写，词表照抄 BambuSphere**（`lifecycle_label`/`select_ui_status`）：未配置→`setup`、连接中→`connecting`（BS 兜底为 `waiting...`，刻意取更明确的词）、断开→`offline`、刚连上→`connected`、RUNNING→`printing`、PREPARE/INIT/SLICING→`preparing`、PAUSE→`paused`、FINISH→`done`、FAILED→`failed`（保留红）、IDLE→`idle`、OFFLINE→`offline`、未知原样；`PrinterStateText` 与 conn 分支改词 + 两处防回归注释（该行禁中文）。**剩余时间行**：`font_bambu_icons_20.c` 重新生成为三字形（+ U+F144E `clock-time-four-outline` = BS 的 `kMdiClock`，lv_font_conv 工具链沿用、字体名不变），单 label 换成居中 flex 行 [时钟图标(灰 #999, gap 6) + 数值]，格式照 BS `remaining_text()`：FINISH→`Done`、无数据/未连接→`--m`、≥60min→`1h 35m`、<60min→`45m`（`PrinterRemainingText()`，静态 buf 仅持锁调用）；引导语/设置页中文不动（走继承字体正常）
+- 验证: clang-format --dry-run 通过；编译 xiaozhi.bin 0x2fd880（+384B=第三字形，分区余 24%）；COM7 烧录 + 258s 监视：启动无 crash、`show_printer` 注册、历史崩溃点通过；**该轮设备已换网络**（page7-jm→Halosee, 192.168.110.x），配置的打印机 192.168.31.172 不在同网段 → `esp-tls select() timeout`→`mqtt error`→offline，按设计 ~30s 退避重试（预期内环境性失败，正好走 offline 状态路径）；用户实测滑动 card0↔1↔2 正常、BLE 随卡片启停、free sram 49KB(扫描)/115KB 稳定；**待目视/待原网络复测**：`offline`/`idle`/`done` 等全词显示、时钟图标 + `--m`/`Done`/`1h 35m`、回原网络后在线状态词
+
+### [2026-10-08] 微调：状态字体 30px + 设置页按钮上移
+- 状态: 进行中（编译+clang-format+烧录待监视验证，待目视确认字号与按钮落点）
+- 范围: main/boards/waveshare/esp32-s3-touch-lcd-1.46/{config.json,esp32-s3-touch-lcd-1.46.cc,README.md}、AGENTS.md
+- 需求: 1) 打印机状态字体再增大；2) 第二屏、第三屏设置界面的保存/返回按钮太靠下，圆屏不好点，上移
+- 方案: **状态字体 20→30px**：改用 `lv_font_montserrat_30`（`config.json` 加 `CONFIG_LV_FONT_MONTSERRAT_30=y`，lv_font.h 自带声明无需宏；纯 ASCII ~+15KB，状态行本就英文），y 170→166（行高33，避让 IP 行 y=206）；删除 `LV_FONT_DECLARE(font_noto_sans_basic_20_4)` 及唯一引用 → noto20 被链接器 GC，**bin 净减 ~80KB（0x2fd880→0x2ea150，分区余 24%→26%）**；两处注释同步（纯 ASCII 字体中文会整字不画 + 531 汉字历史根因）。**按钮上移**：第二屏 BLE 返回 `120x56 BOTTOM_MID y=+4→-28`（底边416→384，框328..384×146..266，该处半弦104整键入弦内）；第三屏保存/完成/返回 `96x44 ±56 y=+2→-28`（底边384，弦 x=102..310 覆盖三键，键盘310以下不重叠）；两处注释/README 写明"贴边圆弧区难按"的上移理由
+- 验证: clang-format --dry-run 通过；编译通过（含 CONFIG_LV_FONT_MONTSERRAT_30 生效）；烧录 COM7；待目视：状态字 30px 明显变大、两个设置页按钮位置舒服好点、编辑态（键盘弹出）下按钮不被遮挡
+
+### [2026-10-08] 设置页按钮命中框扩大（ext_click_area）
+- 状态: 进行中（编译+烧录+170s 监视通过；监视中用户实测两页设置开关多次、关闭均走按钮回调，待手感确认）
+- 范围: main/boards/waveshare/esp32-s3-touch-lcd-1.46/{esp32-s3-touch-lcd-1.46.cc,README.md}、AGENTS.md
+- 需求: 状态字体已认可；但设置页保存/返回按钮"不太容易触发，必须按到文字才能操作？"
+- 排查（只读）: LVGL9 命中链查清——`lv_indev_search_obj` 取最深坐标命中并跳过 hidden（lv_indev.c:618）；label 构造即去 CLICKABLE（lv_label.c:762）→ 点文字最终落到父按钮；`lv_obj_hit_test` = CLICKABLE + coords+ext_click_pad（lv_obj_pos.c:1199 / lv_obj_get_click_area）；`lv_obj` 默认带 CLICKABLE（lv_obj.c:584）、`lv_button` 去 SCROLLABLE（lv_button.c:66）→ 纯代码路径整块按钮都该可点；已排除 hidden 的"完成"同位遮挡、邻居容器遮挡、滚动吞点击、CLICKED 事件缺失（槽位/绑定按钮同事件码实机一直好用）。与本板历史一致：中区按钮（56×56/72×40）从无问题，贴下缘控件（齿轮）当年必须扩热区才能点 → 判定为下缘区按压/坐标误差把边缘点击带到盒外
+- 方案: `lv_obj_set_ext_click_area()`（命中框=coords+ext，纯命中扩张、视觉零变化，LVGL 自家 arc/slider 同款）：第二屏返回 **+16**（孤立无邻居）；第三屏保存/完成/返回 **+8**（上限：save 扩后 94..206、back 206..318，零重叠——back 是后建兄弟，重叠区会归它，会偷走 save 右缘）
+- 验证: format + 编译 0x2ea180（+48B）+ 烧录通过；170s 监视：`settings opened/closed`×2、`printer settings opened/closed`×3，**每次 closed 前均无 `swipe right closes settings` → 关闭全部来自按钮回调**（返回/保存实机已触发）；无 crash；待用户确认手感，若仍不灵 → 下一步加点击目标探针日志（indev 目标对象 + 坐标）
