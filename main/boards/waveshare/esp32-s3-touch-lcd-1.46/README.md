@@ -240,4 +240,27 @@ https://www.waveshare.net/shop/ESP32-S3-Touch-LCD-1.46B.htm
   `CONFIG_MQTT_TASK_STACK_ON_EXTERNAL_MEMORY=y`（16KB 收包缓冲 + 8KB 任务栈
   放 PSRAM，内部 SRAM 只剩 ~48KB，放内部撑不住）。
 
+## 自动熄屏（PowerSaveTimer）
+
+- 此前本板**从未接 `PowerSaveTimer`**，屏幕永不熄灭（其它 Waveshare 板
+  都是 `new PowerSaveTimer(-1, 60, 300)`）。现补上：
+  `InitializePowerSaveTimer()` → `PowerSaveTimer(-1, 60, -1)`——闲置 60s
+  进入熄屏，**无关机路径**（本板没有 PMIC PowerOff，第三参数 -1）；
+  `cpu_max_freq` 也是 -1，**唤醒词检测保持运行**，黑屏时仍可语音唤醒。
+- 熄屏 = `GetDisplay()->SetPowerSaveMode(true)`（sleepy 表情）+
+  `GetBacklight()->SetBrightness(0)`；亮屏 = `SetPowerSaveMode(false)` +
+  `RestoreBrightness()`（读 NVS `display/brightness`，默认 75）。
+- 允许进入的门槛是 `Application::CanEnterSleepMode()`：仅 idle、
+  音频通道关闭、音频空闲时才计时（PowerSaveTimer 内部每秒检查）。
+- **唤醒源**：
+  - 触摸：`InitializeTouch()` 在 touch indev 上挂
+    `lv_indev_add_event_cb(..., LV_EVENT_PRESSED)`（与滑动手势同一 indev
+    事件表，PRESSED 无条件送达）→ `power_save_timer_->WakeUp()`。
+  - 按键：BOOT 短按、电源键长按回调开头先 `WakeUp()`。
+  - 语音/状态活动：override `SetPowerSaveLevel()`——Application 进入
+    listening/speaking 等会把档位提到 PERFORMANCE，非 LOW_POWER 即
+    `WakeUp()`（同 jiuchuan/genjutech 板的写法），黑屏时被唤醒词拉起
+    对话也会自动亮屏。
+- 长按电源键的手动熄屏/亮屏（backlight 0 + `PWR_Control_PIN`）保持不变。
+
 

@@ -27,6 +27,7 @@
 #include "lcd_display.h"
 #include "lvgl_theme.h"
 #include "mcp_server.h"
+#include "power_save_timer.h"
 #include "touch_spd2010.h"
 
 #define TAG "waveshare_lcd_1_46"
@@ -1552,7 +1553,29 @@ private:
     button_handle_t boot_btn, pwr_btn;
     button_driver_t* boot_btn_driver_ = nullptr;
     button_driver_t* pwr_btn_driver_ = nullptr;
+    PowerSaveTimer* power_save_timer_ = nullptr;
     static CustomBoard* instance_;
+
+    // Auto screen-off: this board has no PMIC power-off path, so only the
+    // backlight goes down. 60s of idle (Application::CanEnterSleepMode gates
+    // it to idle state, no open audio channel) turns the panel off; any
+    // touch or button press turns it back on. cpu_max_freq/shutdown stay -1:
+    // wake word detection keeps running so the device can still be woken
+    // by voice while the screen is dark.
+    void InitializePowerSaveTimer() {
+        power_save_timer_ = new PowerSaveTimer(-1, 60, -1);
+        power_save_timer_->OnEnterSleepMode([this]() {
+            ESP_LOGI(TAG, "entering screen-off mode");
+            GetDisplay()->SetPowerSaveMode(true);
+            GetBacklight()->SetBrightness(0);
+        });
+        power_save_timer_->OnExitSleepMode([this]() {
+            ESP_LOGI(TAG, "leaving screen-off mode");
+            GetDisplay()->SetPowerSaveMode(false);
+            GetBacklight()->RestoreBrightness();
+        });
+        power_save_timer_->SetEnabled(true);
+    }
 
     void InitializeI2c() {
         // Initialize I2C peripheral
@@ -1670,6 +1693,18 @@ private:
         // arrive on the indev list and do not touch any widget, so ordering
         // against the UI build does not matter.
         display_->RegisterSwipeDetection(touch_indev);
+        // Screen-off wake: any touch press exits power-save mode. Registered
+        // on the same indev event list as the swipe gesture for the same
+        // reason documented there - it fires unconditionally on PRESSED.
+        lv_indev_add_event_cb(
+            touch_indev,
+            [](lv_event_t* event) {
+                auto self = static_cast<CustomBoard*>(lv_event_get_user_data(event));
+                if (self != nullptr && self->power_save_timer_ != nullptr) {
+                    self->power_save_timer_->WakeUp();
+                }
+            },
+            LV_EVENT_PRESSED, this);
     }
 
     void InitializeButtonsCustom() {
@@ -1700,6 +1735,9 @@ private:
             [](void* button_handle, void* usr_data) {
                 auto self = static_cast<CustomBoard*>(usr_data);
                 auto& app = Application::GetInstance();
+                if (self->power_save_timer_ != nullptr) {
+                    self->power_save_timer_->WakeUp();
+                }
                 if (app.GetDeviceState() == kDeviceStateStarting) {
                     self->EnterWifiConfigMode();
                     return;
@@ -1732,6 +1770,9 @@ private:
             pwr_btn, BUTTON_LONG_PRESS_START, nullptr,
             [](void* button_handle, void* usr_data) {
                 auto self = static_cast<CustomBoard*>(usr_data);
+                if (self->power_save_timer_ != nullptr) {
+                    self->power_save_timer_->WakeUp();
+                }
                 if (self->GetBacklight()->brightness() > 0) {
                     self->GetBacklight()->SetBrightness(0);
                     gpio_set_level(PWR_Control_PIN, false);
@@ -1768,6 +1809,17 @@ private:
     }
 
 public:
+    // Application raises the power level to PERFORMANCE on any activity
+    // (listening, speaking, ...) and drops it back to LOW_POWER when idle -
+    // the same hook jiuchuan/genjutech boards use to re-light the panel when
+    // a conversation starts, even if it was woken by voice while dark.
+    virtual void SetPowerSaveLevel(PowerSaveLevel level) override {
+        if (level != PowerSaveLevel::LOW_POWER && power_save_timer_ != nullptr) {
+            power_save_timer_->WakeUp();
+        }
+        WifiBoard::SetPowerSaveLevel(level);
+    }
+
     // Wrap the Application's network callback instead of replacing it: the
     // Bambu MQTT client starts 2s after the station gets its IP (delaying
     // keeps our TLS handshake apart from the XiaoZhi cloud protocol's first
@@ -1804,6 +1856,7 @@ public:
         InitializeButtons();
         InitializeTools();
         GetBacklight()->RestoreBrightness();
+        InitializePowerSaveTimer();
     }
 
     virtual AudioCodec* GetAudioCodec() override {

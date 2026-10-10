@@ -316,3 +316,11 @@ Log:
 - 排查（只读）: LVGL9 命中链查清——`lv_indev_search_obj` 取最深坐标命中并跳过 hidden（lv_indev.c:618）；label 构造即去 CLICKABLE（lv_label.c:762）→ 点文字最终落到父按钮；`lv_obj_hit_test` = CLICKABLE + coords+ext_click_pad（lv_obj_pos.c:1199 / lv_obj_get_click_area）；`lv_obj` 默认带 CLICKABLE（lv_obj.c:584）、`lv_button` 去 SCROLLABLE（lv_button.c:66）→ 纯代码路径整块按钮都该可点；已排除 hidden 的"完成"同位遮挡、邻居容器遮挡、滚动吞点击、CLICKED 事件缺失（槽位/绑定按钮同事件码实机一直好用）。与本板历史一致：中区按钮（56×56/72×40）从无问题，贴下缘控件（齿轮）当年必须扩热区才能点 → 判定为下缘区按压/坐标误差把边缘点击带到盒外
 - 方案: `lv_obj_set_ext_click_area()`（命中框=coords+ext，纯命中扩张、视觉零变化，LVGL 自家 arc/slider 同款）：第二屏返回 **+16**（孤立无邻居）；第三屏保存/完成/返回 **+8**（上限：save 扩后 94..206、back 206..318，零重叠——back 是后建兄弟，重叠区会归它，会偷走 save 右缘）
 - 验证: format + 编译 0x2ea180（+48B）+ 烧录通过；170s 监视：`settings opened/closed`×2、`printer settings opened/closed`×3，**每次 closed 前均无 `swipe right closes settings` → 关闭全部来自按钮回调**（返回/保存实机已触发）；无 crash；待用户确认手感，若仍不灵 → 下一步加点击目标探针日志（indev 目标对象 + 坐标）
+
+### [2026-10-11] 自动熄屏（本板从未接 PowerSaveTimer）
+- 状态: 已完成（编译+烧录+监视验证通过；触摸/按键/语音唤醒待实测）
+- 范围: main/boards/waveshare/esp32-s3-touch-lcd-1.46/{esp32-s3-touch-lcd-1.46.cc,README.md}、AGENTS.md
+- 需求: 没有熄屏（屏幕永不自动关闭）
+- 根因: 本板是极少数**完全没接 `PowerSaveTimer`** 的板子（其它 Waveshare 板都是 `new PowerSaveTimer(-1, 60, 300)` + `SetPowerSaveMode` 回调），构造函数里根本没有对应初始化
+- 方案: `InitializePowerSaveTimer()` → `PowerSaveTimer(-1, 60, -1)`（60s 闲置熄屏；无 PMIC 关机路径故 shutdown=-1；cpu_max_freq=-1 不动 CPU 频率、**唤醒词检测保持运行**）。熄屏=`SetPowerSaveMode(true)`+`SetBrightness(0)`，亮屏=`SetPowerSaveMode(false)`+`RestoreBrightness()`；计时门槛由 `Application::CanEnterSleepMode()`（仅 idle/无音频通道）把关。**唤醒源三路**：① touch indev `lv_indev_add_event_cb(..., LV_EVENT_PRESSED)`（与滑动手势同一 indev 事件表）→ `WakeUp()`；② BOOT 短按/电源键长按回调开头先 `WakeUp()`；③ override `SetPowerSaveLevel()` 非 LOW_POWER 即 `WakeUp()`（Application 进 listening/speaking 提档，同 jiuchuan 写法，黑屏被语音唤醒也会自动亮）。长按电源键手动熄屏逻辑不动
+- 验证: clang-format --dry-run 通过；编译 xiaozhi.bin 0x2ea990（分区余 26%）；烧录 COM7（先结束两个残留 `idf.py flash monitor` 进程 16876/30492）+ 105s 监视：启动即 `PowerSaveTimer: Power save timer enabled`，66s（idle 后 60s 准点）`Enabling power save mode` → `entering screen-off mode` → `Backlight: Set brightness to 0`，**自动熄屏硬件已确认**，无 crash、free sram 稳定 114KB；待实测：触摸/按键/语音唤醒亮屏、亮屏后亮度恢复 NVS 值
