@@ -1137,4 +1137,15 @@ menu "TAIJIPAI_S3_CONFIG"
         启动双声道
 endmenu
 
+config ESP_VIDEO_USE_CUSTOMIZED_ESP_H264_VERSION
+    bool "Use Customized esp_h264 Version"
+    default n
+    help
+        兼容性占位选项：esp_video 2.5.0 的 manifest 在 if() 条件中引用
+        $CONFIG{ESP_VIDEO_USE_CUSTOMIZED_ESP_H264_VERSION}，而锁文件锁定的
+        esp_video 2.4.1 并未定义该选项，会导致依赖解析报
+        "Kconfig variable not found" 并使 reconfigure 失败。
+        与 esp_video 2.5.0 的同名选项语义保持一致（默认关闭，继续使用
+        manifest 里锁定的 esp_h264 版本）。esp_video 升级到 >= 2.5.0 后可删除本项。
+
 endmenu
